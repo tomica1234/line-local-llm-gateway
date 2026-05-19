@@ -21,6 +21,7 @@ GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "CHANGE_ME")
 class InterpretRequest(BaseModel):
     text: str
     now: str
+    date_context: Dict[str, Any] = {}
     open_tasks: List[Dict[str, Any]] = []
     context: Dict[str, Any] = {}
 
@@ -42,6 +43,7 @@ def interpret(
 
     user_payload = {
         "user_text": req.text,
+    	"date_context": req.date_context,
         "open_tasks": req.open_tasks,
         "context": req.context,
     }
@@ -125,6 +127,14 @@ action一覧:
 - 「今日」「明日」「昨日」は現在日時を基準に YYYY-MM-DD に変換
 - 期限が不明なら due_at は null
 - リマインド時刻が不明なら remind_at は null
+
+深夜日付ルール:
+- user_payload.date_context.is_late_night が true の場合、現在時刻は0:00〜3:59です。
+- この時間帯の「今日」「今日の日記」「今日やったこと」は、実際の日付ではなく date_context.business_date の可能性があります。
+- 日記 add_diary の date は、迷う場合は date_context.business_date を優先してください。
+- ただし、ユーザーが「本日」「日付が変わってから」「明日」など明確に actual_date 側を指す場合は actual_date を使ってください。
+- 日付が重要で判断できない場合は ask_clarification を返してください。
+- ask_clarification の文面には business_date_label と actual_date_label の両方を含めてください。
 
 出力形式:
 {{
