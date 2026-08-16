@@ -1,0 +1,73 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-personal-agent"
+version = "0.1.0"
+description = "Local-first single-user personal agent runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "httpx>=0.27,<1",
+  "pydantic>=2.8,<3",
+  "uvicorn[standard]>=0.30,<1",
+  "webauthn>=3,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2,<9",
+  "pytest-asyncio>=0.23,<1",
+  "ruff>=0.8,<1",
+]
+voice = [
+  "numpy>=2,<3",
+  "openwakeword>=0.6,<1",
+  "sounddevice>=0.5,<1",
+]
+browser-worker = [
+  "playwright>=1.54,<2",
+]
+auth = [
+  "cryptography>=45,<47",
+]
+line-desktop = [
+  "Pillow>=11,<12",
+  "pywin32>=311; sys_platform == 'win32'",
+  "pywinauto>=0.6.9,<0.7; sys_platform == 'win32'",
+  "winrt-runtime>=3.2,<4; sys_platform == 'win32'",
+  "winrt-Windows.Foundation>=3.2,<4; sys_platform == 'win32'",
+  "winrt-Windows.Foundation.Collections>=3.2,<4; sys_platform == 'win32'",
+  "winrt-Windows.Globalization>=3.2,<4; sys_platform == 'win32'",
+  "winrt-Windows.Graphics.Imaging>=3.2,<4; sys_platform == 'win32'",
+  "winrt-Windows.Media.Ocr>=3.2,<4; sys_platform == 'win32'",
+  "winrt-Windows.Storage.Streams>=3.2,<4; sys_platform == 'win32'",
+]
+
+[project.scripts]
+personal-agent = "personal_agent.main:run"
+personal-agent-voice = "personal_agent.voice_gateway.runtime:run"
+personal-agent-browser-worker = "personal_agent.browser_worker.main:run"
+personal-agent-secret = "personal_agent.secret.cli:run"
+personal-agent-sandbox = "personal_agent.economic.cli:run"
+personal-agent-benchmark = "personal_agent.evaluation.cli:run"
+personal-agent-backup = "personal_agent.backup_cli:run"
+personal-agent-line-desktop = "personal_agent.line_desktop_bridge.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/personal_agent"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

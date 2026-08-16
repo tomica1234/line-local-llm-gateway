@@ -1,0 +1,23 @@
+[Unit]
+Description=Local Personal Agent Core
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/wip/line-local-llm-gateway/personal-agent
+EnvironmentFile=%h/wip/line-local-llm-gateway/personal-agent/.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=%h/wip/line-local-llm-gateway/personal-agent/.venv/bin/personal-agent
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/wip/line-local-llm-gateway/personal-agent/data
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

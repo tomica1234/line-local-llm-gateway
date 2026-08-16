@@ -1,0 +1,22 @@
+[Unit]
+Description=Local Qwen3.6 35B A3B llama.cpp Server
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=%h/wip/line-local-llm-gateway/personal-agent/models/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf
+
+[Service]
+Type=simple
+WorkingDirectory=%h/wip/line-local-llm-gateway/personal-agent
+EnvironmentFile=%h/wip/line-local-llm-gateway/personal-agent/.env
+ExecStart=%h/wip/line-local-llm-gateway/personal-agent/scripts/start-qwen.sh
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=default.target

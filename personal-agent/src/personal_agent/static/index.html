@@ -1,0 +1,258 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#10231d" />
+    <title>Personal Agent</title>
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="#chat" aria-label="Personal Agent ホーム">
+        <span class="brand-mark">PA</span>
+        <span><strong>Personal Agent</strong><small>Local-first runtime</small></span>
+      </a>
+      <div class="health"><span id="health-dot"></span><span id="health-text">確認中</span></div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <p class="eyebrow">PRIVATE · DURABLE · LOCAL</p>
+        <h1>ひとつのCore、<br />どのチャネルからでも。</h1>
+        <p>Web・LINE・ローカル音声が同じTask Stateを共有します。</p>
+      </section>
+
+      <nav class="tabs" aria-label="画面切り替え">
+        <button class="tab active" data-tab="chat">Chat</button>
+        <button class="tab" data-tab="tasks">Tasks <span id="task-count">0</span></button>
+        <button class="tab" data-tab="memory">Memory</button>
+        <button class="tab" data-tab="controls">Safety</button>
+        <button class="tab" data-tab="ops">Ops</button>
+      </nav>
+
+      <section id="chat" class="panel active">
+        <div id="continuation" class="continuation hidden">
+          <span>Task <code id="continuation-id"></code> を継続</span>
+          <button id="clear-continuation" type="button">解除</button>
+        </div>
+        <div id="messages" class="messages" aria-live="polite">
+          <article class="message agent">
+            <span class="avatar">PA</span>
+            <div><p>準備できています。時刻やタイマーはQwenを呼ばずに処理します。</p></div>
+          </article>
+        </div>
+        <form id="chat-form" class="composer">
+          <textarea id="prompt" rows="1" maxlength="20000" placeholder="メッセージを入力…" required></textarea>
+          <label class="dry-run"><input id="dry-run" type="checkbox" /> Dry-run</label>
+          <button id="send" type="submit" aria-label="送信">送信</button>
+        </form>
+      </section>
+
+      <section id="tasks" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">DURABLE STATE</p><h2>Task Timeline</h2></div>
+          <button id="refresh-tasks" class="secondary" type="button">更新</button>
+        </div>
+        <div id="task-list" class="task-list"></div>
+      </section>
+
+      <section id="memory" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">PERSONAL SEARCH</p><h2>Memory</h2></div>
+          <button id="refresh-memory" class="secondary" type="button">更新</button>
+        </div>
+        <form id="memory-search-form" class="search-box">
+          <input id="memory-search" maxlength="2000" placeholder="会話・Event・Memoryを横断検索…" required />
+          <button type="submit">検索</button>
+        </form>
+        <div id="search-results" class="search-results hidden"></div>
+        <form id="memory-create-form" class="memory-create">
+          <div>
+            <label for="memory-statement">明示的に覚える</label>
+            <input id="memory-statement" maxlength="20000" placeholder="例: 新幹線は窓側を好む" required />
+          </div>
+          <select id="memory-kind" aria-label="Memory種別">
+            <option value="fact">Fact</option>
+            <option value="preference">Preference</option>
+            <option value="commitment">Commitment</option>
+            <option value="episodic">Episodic</option>
+            <option value="summary">Summary</option>
+          </select>
+          <button type="submit">Remember</button>
+        </form>
+        <div class="memory-grid">
+          <div><h3>Long-term Memory</h3><div id="memory-list" class="memory-list"></div></div>
+          <div><h3>Recent Events</h3><div id="event-list" class="event-list"></div></div>
+        </div>
+      </section>
+
+      <section id="controls" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">KILL SWITCHES</p><h2>Safety controls</h2></div>
+        </div>
+        <p class="muted">変更には環境変数で設定したAdmin Tokenが必要です。Tokenはタブを閉じると破棄されます。</p>
+        <label class="token-field">Admin Token<input id="admin-token" type="password" autocomplete="off" placeholder="PERSONAL_AGENT_ADMIN_TOKEN" /></label>
+        <div class="passkey-control">
+          <div>
+            <p class="eyebrow">IPHONE · FACE ID</p>
+            <h3>Passkey authentication</h3>
+            <p id="passkey-status" class="muted">Passkey設定を確認中です。</p>
+          </div>
+          <div class="card-actions">
+            <button id="passkey-login" class="secondary" type="button">Face IDでサインイン</button>
+            <button id="passkey-logout" class="secondary" type="button" hidden>サインアウト</button>
+          </div>
+          <form id="passkey-register-form" class="passkey-register">
+            <input id="passkey-label" maxlength="80" value="iPhone Face ID" aria-label="Passkey名" required />
+            <button type="submit">この端末を登録</button>
+          </form>
+          <div id="passkey-list" class="pending-list"></div>
+        </div>
+        <div class="approval-control">
+          <div>
+            <p class="eyebrow">PENDING ACTIONS</p>
+            <h3>Approvals & authentication</h3>
+            <p class="muted">R2/R3はAdmin Session、R4/R5はiPhone Face IDまたはWindows Helloで1回だけ承認します。</p>
+          </div>
+          <button id="refresh-pending" class="secondary" type="button">保留中を確認</button>
+          <div id="approval-list" class="pending-list"></div>
+          <div id="auth-session-list" class="pending-list"></div>
+        </div>
+        <div class="secret-control">
+          <div>
+            <p class="eyebrow">SECRET BROKER</p>
+            <h3>Credential metadata & usage</h3>
+            <p class="muted">値は表示・Exportせず、Credential ID・Origin・Action・結果だけを表示します。</p>
+          </div>
+          <button id="refresh-secrets" class="secondary" type="button">利用履歴を確認</button>
+          <form id="credential-form" class="credential-form" autocomplete="off">
+            <label>Credential base ID
+              <input id="credential-base" required pattern="secret://[a-z0-9][a-z0-9._/-]{2,200}" placeholder="secret://communication/example/main" />
+            </label>
+            <label>Account label
+              <input id="credential-account" required maxlength="200" placeholder="main" />
+            </label>
+            <label>Exact login Origin
+              <input id="credential-origin" required type="url" placeholder="https://login.example.com" />
+            </label>
+            <label>Username / email
+              <input id="credential-username" autocomplete="username" placeholder="you@example.com" />
+            </label>
+            <label>Password
+              <input id="credential-password" type="password" autocomplete="new-password" />
+            </label>
+            <label>TOTP seed（任意・Base32）
+              <input id="credential-totp" type="password" autocomplete="off" />
+            </label>
+            <p class="muted">保存にはFace ID/Windows Helloが必要です。値はWindows DPAPIで暗号化され、LLM・Core DB・監査ログには保存されません。</p>
+            <button type="submit">認証情報を暗号化保存</button>
+          </form>
+          <div id="secret-list" class="pending-list"></div>
+          <div id="secret-usage-list" class="pending-list"></div>
+        </div>
+        <div id="lock-list" class="lock-list"></div>
+        <div class="browser-control">
+          <div>
+            <p class="eyebrow">BROWSER SESSIONS</p>
+            <h3>Windows Chrome profiles</h3>
+            <p class="muted">用途別Context、現在URL、Human Takeover状態を確認・終了できます。</p>
+          </div>
+          <button id="refresh-browser-profiles" class="secondary" type="button">接続して確認</button>
+          <div id="browser-profile-list" class="browser-profile-list"></div>
+        </div>
+        <div class="activity-control">
+          <div>
+            <p class="eyebrow">ACTIVITY CAPTURE</p>
+            <h3>Safari Private Browsing</h3>
+            <p class="muted">収集は既定OFFです。Sensitive DomainはOriginのみ、禁止Domainは保存しません。</p>
+          </div>
+          <button id="activity-toggle" class="secondary" type="button">確認中</button>
+          <label>収集禁止Domain（1行に1つ）
+            <textarea id="activity-blocked-domains" rows="5" placeholder="example.com"></textarea>
+          </label>
+          <button id="save-activity-domains" class="secondary" type="button">設定を保存</button>
+        </div>
+      </section>
+
+      <section id="ops" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">OPERATIONS</p><h2>Health & governance</h2></div>
+          <button id="refresh-ops" class="secondary" type="button">すべて更新</button>
+        </div>
+        <p class="muted">Safety画面のAdmin Tokenを使います。Secret値はこの画面にもExportにも表示しません。</p>
+        <div class="ops-grid">
+          <article class="ops-card span-two">
+            <div class="ops-head"><div><p class="eyebrow">PROACTIVE</p><h3>Attention manager</h3></div><button id="proactive-toggle" class="secondary" type="button">確認中</button></div>
+            <div id="opportunity-list" class="pending-list"></div>
+          </article>
+          <article class="ops-card">
+            <p class="eyebrow">SYSTEM HEALTH</p><h3>Runtime & storage</h3>
+            <div id="system-health" class="metric-list"></div>
+          </article>
+          <article class="ops-card">
+            <p class="eyebrow">MODEL PERFORMANCE</p><h3>Model / Harness metrics</h3>
+            <div id="model-metrics" class="metric-list"></div>
+          </article>
+          <article class="ops-card">
+            <p class="eyebrow">LINE DESKTOP BRIDGE</p><h3>Private LINE sync</h3>
+            <p class="muted">Windows LINEの表示範囲をOCRし、画像を保存せずローカル検索へ同期します。</p>
+            <div id="line-desktop-health" class="metric-list"></div>
+          </article>
+          <article class="ops-card">
+            <p class="eyebrow">CONNECTORS</p><h3>Permission & revocation</h3>
+            <div id="connector-list" class="pending-list"></div>
+          </article>
+          <article class="ops-card">
+            <p class="eyebrow">ECONOMIC POLICY</p><h3>Budgets & Payees</h3>
+            <div id="budget-list" class="metric-list"></div>
+            <div id="payee-list" class="pending-list"></div>
+          </article>
+          <article class="ops-card span-two">
+            <div class="ops-head"><div><p class="eyebrow">BENCHMARK</p><h3>17-category dry-run harness</h3></div><div class="card-actions"><button id="run-smoke-benchmark" type="button">Tier 0 smoke</button><button id="run-full-benchmark" type="button">全Case 1回</button></div></div>
+            <p class="muted">全Caseは設定済み外部Adapterへのread-only接続を含みます。Mutationはdry-runです。未設定Capabilityはskipされます。</p>
+            <div id="benchmark-result" class="metric-list"></div>
+          </article>
+          <article class="ops-card span-two">
+            <p class="eyebrow">AUDIT LOG</p><h3>Searchable redacted events</h3>
+            <form id="audit-search-form" class="search-box"><input id="audit-search" maxlength="2000" placeholder="Action・actor・reasonを検索…"><button type="submit">検索</button></form>
+            <div id="audit-list" class="audit-list"></div>
+          </article>
+          <article class="ops-card span-two">
+            <p class="eyebrow">DATA CONTROL</p><h3>Export & scoped delete</h3>
+            <p class="muted">ExportにはSecret値を含めません。Deleteは選択scopeと確認文字列が完全一致した場合だけ実行され、Secret Storeは別管理のため触れません。</p>
+            <div class="data-actions">
+              <button id="export-data" type="button">JSON Export</button>
+              <select id="delete-scope" aria-label="削除範囲"><option>activity</option><option>memory</option><option>communication</option><option>calendar</option><option>tasks</option><option>economic</option><option>audit</option><option>all</option></select>
+              <input id="delete-confirmation" autocomplete="off" placeholder="DELETE:scope と入力">
+              <button id="delete-data" class="danger" type="button">Delete</button>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="task-dialog">
+      <div class="dialog-head"><h2>Task detail</h2><button id="close-dialog" aria-label="閉じる">×</button></div>
+      <div id="task-detail"></div>
+    </dialog>
+
+    <template id="task-template">
+      <article class="task-card">
+        <button class="task-open" type="button">
+          <span class="task-state"></span><time></time>
+          <h3></h3><p class="task-meta"></p>
+        </button>
+        <div class="task-actions">
+          <button data-action="continue" type="button">別チャネルで継続</button>
+          <button data-action="pause" type="button">Pause</button>
+          <button data-action="resume" type="button">Resume</button>
+          <button data-action="cancel" class="danger" type="button">Cancel</button>
+        </div>
+      </article>
+    </template>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>

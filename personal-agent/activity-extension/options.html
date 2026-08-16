@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Activity Capture Settings</title>
+    <style>
+      body { max-width: 680px; margin: 40px auto; padding: 0 18px; font: 16px system-ui; color: #17221e; background: #f3f0e8; }
+      form { display: grid; gap: 16px; padding: 22px; border: 1px solid #d9d7cd; border-radius: 16px; background: #fffdf8; }
+      label { display: grid; gap: 6px; font-weight: 700; }
+      input { padding: 11px; border: 1px solid #d9d7cd; border-radius: 8px; }
+      button { padding: 11px; border: 0; border-radius: 8px; color: white; background: #102f25; font-weight: 800; }
+      small, #status { color: #6a756f; }
+    </style>
+  </head>
+  <body>
+    <h1>Activity Capture</h1>
+    <p>URL、title、query、時刻、滞在時間だけをローカルAgentへ送ります。</p>
+    <form id="settings">
+      <label>Core URL<input id="core-url" type="url" placeholder="https://cyborg.example.ts.net" required /></label>
+      <label>Activity Token<input id="activity-token" type="password" autocomplete="off" required /></label>
+      <label><span><input id="paused" type="checkbox" /> この端末で収集を一時停止</span></label>
+      <button type="submit">保存して送信を試す</button>
+      <small>フォーム入力、Cookie、本文、Screenshot、キー入力は取得しません。</small>
+      <div id="status"></div>
+    </form>
+    <script src="options.js"></script>
+  </body>
+</html>

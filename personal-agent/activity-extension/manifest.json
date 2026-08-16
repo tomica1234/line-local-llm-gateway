@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "Personal Agent Activity Capture",
+  "version": "0.1.0",
+  "description": "Sends minimal Safari browsing metadata to your local Personal Agent.",
+  "permissions": ["alarms", "storage"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_ui": {
+    "page": "options.html",
+    "open_in_tab": true
+  }
+}
