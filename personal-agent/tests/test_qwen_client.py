@@ -81,3 +81,32 @@ async def test_qwen_client_can_enable_thinking_explicitly() -> None:
     )
     assert await client.complete([{"role": "user", "content": "質問"}]) == "回答"
     assert request_payload["chat_template_kwargs"] == {"enable_thinking": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (httpx.Response(503, text="upstream secret details"), "HTTP 503"),
+        (httpx.Response(200, json={"choices": [{"message": {"content": ""}}]}), "empty"),
+    ],
+)
+async def test_qwen_client_reports_bounded_http_and_empty_response_errors(
+    response: httpx.Response, message: str
+) -> None:
+    client = QwenClient(
+        Settings(),
+        transport=httpx.MockTransport(lambda _request: response),
+    )
+    with pytest.raises(RuntimeError, match=message):
+        await client.complete([{"role": "user", "content": "質問"}])
+
+
+@pytest.mark.asyncio
+async def test_qwen_client_converts_timeout_to_runtime_error() -> None:
+    def timeout(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    client = QwenClient(Settings(), transport=httpx.MockTransport(timeout))
+    with pytest.raises(RuntimeError, match="timed out"):
+        await client.complete([{"role": "user", "content": "質問"}])

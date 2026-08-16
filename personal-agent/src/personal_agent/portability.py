@@ -13,6 +13,7 @@ DeleteScope = Literal[
     "communication",
     "calendar",
     "tasks",
+    "personal",
     "economic",
     "audit",
     "all",
@@ -46,6 +47,8 @@ _EXPORT_TABLES = (
     "preference_candidates",
     "workflow_candidates",
     "benchmark_runs",
+    "personal_todos",
+    "diary_entries",
 )
 
 
@@ -150,6 +153,12 @@ class DataPortabilityService:
                         "inbound_events",
                         "benchmark_runs",
                     ),
+                    deleted,
+                )
+            if scope in {"personal", "all"}:
+                self._delete_tables(
+                    connection,
+                    ("personal_todos", "diary_entries"),
                     deleted,
                 )
             if scope == "all":

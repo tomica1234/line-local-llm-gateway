@@ -7,8 +7,10 @@ software境界を意味し、外部credential・実機・第三者serviceまで�
 
 - SQLite Durable Task State、checkpoint、再起動時の安全なPause、Pause/Resume/Cancel
 - 型付きTool Broker、決定論的Policy、Risk、Reason Code、Policy version、4種Safety Lock
+- Toolごとのrequired permission強制、step-scoped Tool/permission/risk、grant判断のAudit
 - Mutation Idempotency、Dry-run、single-use Approval、Secret redaction付きAudit
-- loopback限定OpenAI互換Qwen client、Tier 0、最大12 stepのDeep Tool loop
+- trackedなloopback限定OpenAI互換Qwen client、Tier 0、最大12 turnのDeep Tool loop
+- Agent実行Taskと分離したPersonalTodo/Diary table・型付きTool・Asia/Tokyo business date
 - Responsive PWA（Chat処理中・経過秒・完了/失敗表示）、LINE署名/Primary User/再送排除、
   Voice HTTP/WebSocket contract
 - openWakeWord、Energy VAD、whisper.cpp、Piperを接続するWindows Voice Gateway
@@ -34,6 +36,7 @@ software境界を意味し、外部credential・実機・第三者serviceまで�
 - WebAuthn passkeyをiPhone Face ID / Windows Helloで登録・loginし、R4/R5はActionごとのUV署名で承認
 - exact Origin/RP ID、approval内容hash、有効期限、試行回数、single-use、sign counterを検証
 - Tailscale identityまたは送信元検証済みTLS proxy identityとpasskey sessionを重ね、一般の遠隔APIを二重認証
+- Tailscale直接bindはallowed user/passkey/WebAuthn/source-IP identity mapping不足時に起動拒否
 
 ## Phase 5: Communication・Calendar・Scheduler（実装済み、一部provider待ち）
 
@@ -94,3 +97,35 @@ Tailnet限定HTTPS、送信元/identity検証、未ログイン遠隔APIの401�
 実Tool loopまで確認済みです。実Tool loopの生成速度は約27〜28 token/秒でした。
 iPhone Face ID passkeyの登録・sign-inも実機で完了しています。Grant/ACLの管理画面反映、backup passkey、
 外部provider credentialの投入は利用者作業です。
+
+## 現在の分類
+
+### 実装済み
+
+- Qwen Chat Completions client、thinking切替、Tool call JSON、usage/latency、timeout/HTTP/empty応答処理
+- step-scoped Capability PlanとTool Broker permission enforcement
+- PersonalTodoのcreate/list/complete/update、Diaryのcreate/read/search、深夜business date
+- endpoint security class、署名付きLINE webhook、worker token、遠隔identity + passkey境界
+- Activity ORIGIN_ONLY最小化、idempotency、submitted_unknown、approval、secret非露出のunit regression
+- Python 3.11/3.12 GitHub Actions定義
+
+### 部分実装
+
+- Capability Plannerは信頼済みユーザー依頼だけから作る決定論的な初期版です。汎用model plannerや
+  任意workflow生成は行わず、認識できない依頼はTool権限をgrantしません。
+- Todo/DiaryはCore store・Tool・export/deleteまで実装済みですが、専用PWA一覧画面はありません。
+
+### 未実装
+
+- 第二model/router、実銀行・実カード決済、任意shell、無制限desktop automation、Alexa、複数Voice Satellite
+- 大量のsite固有Shopping/Reservation adapter
+
+### 実機検証待ち
+
+- 新しい直接Tailscale bind用peer identity mapping（推奨構成は引き続きloopback proxy）
+- GitHub上でのPython 3.11/3.12 CI実行。ローカルPython 3.12ではRuff/全pytest/compileallを実行済み
+
+### provider credential待ち
+
+- Slack/Gmail/Home Assistantの実service E2E、Google Calendar provider同期
+- LINE Messaging API/LINE Desktopは実装済み境界を維持するが、再構築時は本人credentialと実機確認が必要

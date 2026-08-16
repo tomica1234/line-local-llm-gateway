@@ -284,6 +284,23 @@ def browser_tools(client: BrowserWorkerClient) -> list[ToolDefinition[Any]]:
             "List quarantined downloads.",
         ),
     ]
+    read_tools = {
+        "browser.open",
+        "browser.snapshot",
+        "browser.tabs",
+        "browser.new_tab",
+        "browser.close_tab",
+        "browser.switch_tab",
+        "browser.back",
+        "browser.forward",
+        "browser.reload",
+        "browser.hover",
+        "browser.scroll",
+        "browser.wait",
+        "browser.screenshot",
+        "browser.get_url",
+        "browser.get_downloads",
+    }
     definitions: list[ToolDefinition[Any]] = []
     for name, action, args_model, risk, mutation, description in specifications:
 
@@ -311,7 +328,13 @@ def browser_tools(client: BrowserWorkerClient) -> list[ToolDefinition[Any]]:
                 handler=handler,
                 risk_level=risk,
                 mutation=mutation,
-                required_permissions=("browser.execute",),
+                required_permissions=(
+                    "browser.submit"
+                    if name == "browser.submit"
+                    else "browser.read"
+                    if name in read_tools
+                    else "browser.interact",
+                ),
             )
         )
     return definitions

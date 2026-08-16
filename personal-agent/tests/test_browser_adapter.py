@@ -67,6 +67,7 @@ async def test_core_browser_tool_passes_durable_action_context(tmp_path: Path) -
         dry_run=False,
         reason="read public comparison page",
         allowed_names={"browser.open"},
+        granted_permissions={"browser.read"},
     )
 
     assert result.status == "ok"
@@ -91,6 +92,7 @@ async def test_browser_type_value_is_not_persisted_in_core_action_or_audit(
         dry_run=False,
         reason="fill a non-secret public search field",
         allowed_names={"browser.type"},
+        granted_permissions={"browser.interact"},
     )
 
     assert result.status == "ok"
@@ -117,6 +119,7 @@ async def test_browser_lock_and_risk_policy_cannot_be_bypassed(tmp_path: Path) -
         dry_run=False,
         reason="test browser lock",
         allowed_names={"browser.snapshot"},
+        granted_permissions={"browser.read"},
     )
     storage.set_safety_lock("browser_lock", False)
     approval = await broker.execute(
@@ -127,6 +130,7 @@ async def test_browser_lock_and_risk_policy_cannot_be_bypassed(tmp_path: Path) -
         dry_run=False,
         reason="test risk gate",
         allowed_names={"browser.click"},
+        granted_permissions={"browser.interact"},
     )
 
     assert locked.status == "denied"

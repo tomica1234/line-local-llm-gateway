@@ -5,5 +5,5 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 data/
-models/
+/models/
 nul

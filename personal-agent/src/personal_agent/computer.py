@@ -66,6 +66,7 @@ def computer_tools(storage: Storage) -> list[ToolDefinition[Any]]:
             args_model=EmptyArgs,
             handler=status,
             risk_level=RiskLevel.R0,
+            required_permissions=("computer.read",),
         ),
         ToolDefinition(
             name="computer.notify",
@@ -74,6 +75,7 @@ def computer_tools(storage: Storage) -> list[ToolDefinition[Any]]:
             handler=notify,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("computer.write",),
         ),
         ToolDefinition(
             name="computer.lock",
@@ -82,5 +84,6 @@ def computer_tools(storage: Storage) -> list[ToolDefinition[Any]]:
             handler=lock,
             risk_level=RiskLevel.R2,
             mutation=True,
+            required_permissions=("computer.lock",),
         ),
     ]

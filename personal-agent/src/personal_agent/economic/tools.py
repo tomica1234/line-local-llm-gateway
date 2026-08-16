@@ -128,6 +128,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             handler=create_intent,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("economic.prepare",),
         ),
         ToolDefinition(
             name="economic.set_final_quote",
@@ -139,6 +140,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             handler=quote,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("economic.prepare",),
         ),
         ToolDefinition(
             name="economic.execute_sandbox",
@@ -147,6 +149,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             handler=execute,
             risk_level=RiskLevel.R3,
             mutation=True,
+            required_permissions=("economic.execute",),
         ),
         ToolDefinition(
             name="money.create_transfer_intent",
@@ -158,6 +161,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             handler=transfer_intent,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("economic.prepare",),
         ),
         ToolDefinition(
             name="money.execute_transfer_sandbox",
@@ -166,6 +170,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             handler=execute_transfer,
             risk_level=RiskLevel.R3,
             mutation=True,
+            required_permissions=("economic.execute",),
         ),
         ToolDefinition(
             name="money.reconcile",
@@ -176,5 +181,6 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             args_model=TransactionIdArgs,
             handler=reconcile,
             risk_level=RiskLevel.R0,
+            required_permissions=("economic.read",),
         ),
     ]

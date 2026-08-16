@@ -34,6 +34,7 @@ async def test_mutation_idempotency_prevents_duplicate_job(settings) -> None:
         dry_run=False,
         reason="test",
         allowed_names={"scheduler.create"},
+        granted_permissions={"scheduler.write"},
     )
     second = await broker.execute(
         tool_name="scheduler.create",
@@ -43,6 +44,7 @@ async def test_mutation_idempotency_prevents_duplicate_job(settings) -> None:
         dry_run=False,
         reason="test",
         allowed_names={"scheduler.create"},
+        granted_permissions={"scheduler.write"},
     )
 
     assert first.status == "ok"

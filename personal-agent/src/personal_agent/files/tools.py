@@ -79,6 +79,7 @@ def file_tools(service: FileService) -> list[ToolDefinition[Any]]:
             args_model=SearchArgs,
             handler=search,
             risk_level=RiskLevel.R0,
+            required_permissions=("files.read",),
         ),
         ToolDefinition(
             name="files.read",
@@ -86,6 +87,7 @@ def file_tools(service: FileService) -> list[ToolDefinition[Any]]:
             args_model=ReadArgs,
             handler=read,
             risk_level=RiskLevel.R0,
+            required_permissions=("files.read",),
         ),
         ToolDefinition(
             name="files.copy",
@@ -94,6 +96,7 @@ def file_tools(service: FileService) -> list[ToolDefinition[Any]]:
             handler=copy,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("files.write",),
         ),
         ToolDefinition(
             name="files.move",
@@ -102,6 +105,7 @@ def file_tools(service: FileService) -> list[ToolDefinition[Any]]:
             handler=move,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("files.write",),
         ),
         ToolDefinition(
             name="files.rename",
@@ -110,6 +114,7 @@ def file_tools(service: FileService) -> list[ToolDefinition[Any]]:
             handler=rename,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("files.write",),
         ),
         ToolDefinition(
             name="files.delete",
@@ -118,5 +123,6 @@ def file_tools(service: FileService) -> list[ToolDefinition[Any]]:
             handler=delete,
             risk_level=RiskLevel.R2,
             mutation=True,
+            required_permissions=("files.write",),
         ),
     ]

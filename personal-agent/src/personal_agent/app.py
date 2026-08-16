@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -66,6 +67,7 @@ from .memory.models import (
 from .memory.tools import memory_tools
 from .models.qwen import ModelClient, QwenClient
 from .observability import ObservabilityService
+from .personal_data import PersonalDataStore, personal_data_tools
 from .policy.engine import PolicyEngine
 from .portability import DataPortabilityService, DeleteScope, export_json_bytes
 from .proactive import ProactiveService
@@ -130,6 +132,49 @@ class LearningDecisionRequest(BaseModel):
     accepted: bool
 
 
+class EndpointSecurity(StrEnum):
+    LOCAL_ONLY = "LOCAL_ONLY"
+    REMOTE_AUTHENTICATED = "REMOTE_AUTHENTICATED"
+    ADMIN_ONLY = "ADMIN_ONLY"
+    PUBLIC_SIGNED_WEBHOOK = "PUBLIC_SIGNED_WEBHOOK"
+    WORKER_TOKEN = "WORKER_TOKEN"
+
+
+_ADMIN_PATH_PREFIXES = (
+    "/api/system/",
+    "/api/benchmark/",
+    "/api/data/",
+    "/api/connectors",
+    "/api/economic/",
+    "/api/money/",
+    "/api/files/status",
+    "/api/home/status",
+    "/api/learning/",
+    "/api/approvals",
+    "/api/auth/",
+    "/api/secrets",
+    "/api/browser/",
+    "/api/audit",
+)
+
+
+def endpoint_security(method: str, path: str) -> EndpointSecurity:
+    """Return the route's outer security class; route dependencies remain additive."""
+
+    if method == "POST" and path == "/api/channels/line/webhook":
+        return EndpointSecurity.PUBLIC_SIGNED_WEBHOOK
+    if method == "POST" and path in {
+        "/api/activity/batch",
+        "/api/channels/line-desktop/ingest",
+    }:
+        return EndpointSecurity.WORKER_TOKEN
+    if path in {"/api/metrics"} or path.startswith(_ADMIN_PATH_PREFIXES):
+        return EndpointSecurity.ADMIN_ONLY
+    if method in {"POST", "PATCH", "DELETE"} and path.startswith("/api/calendar/"):
+        return EndpointSecurity.ADMIN_ONLY
+    return EndpointSecurity.REMOTE_AUTHENTICATED
+
+
 class Runtime:
     def __init__(self, settings: Settings, model: ModelClient):
         self.settings = settings
@@ -155,6 +200,12 @@ class Runtime:
         self.calendar.initialize()
         self.economic = EconomicStore(self.storage)
         self.economic.initialize()
+        self.personal_data = PersonalDataStore(
+            self.storage,
+            user_id=settings.user_id,
+            timezone=settings.timezone,
+        )
+        self.personal_data.initialize()
         self.files = FileService(settings.files_roots, settings.files_trash_root)
         self.home = HomeAssistantClient(
             settings.home_assistant_url,
@@ -239,6 +290,8 @@ class Runtime:
             self.broker.register(definition)
         for definition in economic_tools(self.economic):
             self.broker.register(definition)
+        for definition in personal_data_tools(self.personal_data):
+            self.broker.register(definition)
         for definition in file_tools(self.files):
             self.broker.register(definition)
         for definition in home_tools(self.home):
@@ -264,6 +317,8 @@ class Runtime:
             "communication",
             "memory",
             "economic",
+            "personal_todo",
+            "diary",
             "scheduler",
             "proactive",
         }
@@ -430,6 +485,8 @@ def create_app(
     settings: Settings | None = None, model_client: ModelClient | None = None
 ) -> FastAPI:
     configured = settings or Settings.from_env()
+    configured.validate_bind_host()
+    configured.validate_remote_bind_security()
     model = model_client or QwenClient(configured)
     runtime = Runtime(configured, model)
 
@@ -601,21 +658,72 @@ def create_app(
     def is_loopback_connection(connection: Request | WebSocket) -> bool:
         if connection.client is None:
             return False
+        if connection.client.host == "testclient" and configured.host in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            return True
         try:
             return ipaddress.ip_address(connection.client.host).is_loopback
         except ValueError:
             return connection.client.host.casefold() == "localhost"
 
-    def allowed_tailscale_identity(connection: Request | WebSocket) -> bool:
-        tailscale_login = connection.headers.get("Tailscale-User-Login", "").strip().casefold()
-        return tailscale_login in configured.tailscale_allowed_users
+    peer_identities = {
+        str(ipaddress.ip_address(address)): identity
+        for address, identity in configured.tailscale_peer_identities
+    }
+
+    def is_trusted_tls_proxy(connection: Request | WebSocket) -> bool:
+        return is_loopback_connection(connection) and (
+            connection.headers.get("X-Personal-Agent-Remote-Proxy")
+            == "tailscale-direct-tls-v1"
+        )
+
+    def is_trusted_tailscale_serve(connection: Request | WebSocket) -> bool:
+        # Tailscale Serve reaches a loopback-bound backend and injects this header. A remote
+        # socket can never select this branch, and direct binds ignore the header entirely.
+        return (
+            is_loopback_connection(connection)
+            and not connection.headers.get("X-Personal-Agent-Remote-Proxy")
+            and bool(connection.headers.get("Tailscale-User-Login", "").strip())
+        )
+
+    def is_remote_connection(connection: Request | WebSocket) -> bool:
+        return (
+            not is_loopback_connection(connection)
+            or is_trusted_tls_proxy(connection)
+            or is_trusted_tailscale_serve(connection)
+        )
+
+    def trusted_remote_identity(connection: Request | WebSocket) -> str | None:
+        if is_trusted_tls_proxy(connection):
+            forwarded = connection.headers.get("X-Forwarded-For", "").strip()
+            try:
+                forwarded_address = ipaddress.ip_address(forwarded)
+            except ValueError:
+                return None
+            if forwarded_address not in ipaddress.ip_network("100.64.0.0/10"):
+                return None
+            identity = connection.headers.get("Tailscale-User-Login", "").strip().casefold()
+            return identity if identity in configured.tailscale_allowed_users else None
+        if is_trusted_tailscale_serve(connection):
+            identity = connection.headers.get("Tailscale-User-Login", "").strip().casefold()
+            return identity if identity in configured.tailscale_allowed_users else None
+        if connection.client is None:
+            return None
+        try:
+            address = str(ipaddress.ip_address(connection.client.host))
+        except ValueError:
+            return None
+        identity = peer_identities.get(address)
+        return identity if identity in configured.tailscale_allowed_users else None
 
     remote_passkey_exempt_paths = {
         "/api/health",
         "/api/webauthn/status",
         "/api/webauthn/register/options",
         "/api/webauthn/register/verify",
-        "/api/webauthn/credentials",
         "/api/webauthn/login/options",
         "/api/webauthn/login/verify",
         "/api/webauthn/logout",
@@ -648,23 +756,33 @@ def create_app(
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Response:
         response: Response
-        public_line_webhook = (
-            request.method == "POST" and request.url.path == "/api/channels/line/webhook"
-        )
-        trusted_direct_tls_proxy = (
-            request.headers.get("X-Personal-Agent-Remote-Proxy")
-            == "tailscale-direct-tls-v1"
-        )
-        remote_request = trusted_direct_tls_proxy or not is_loopback_connection(request)
-        if configured.tailscale_allowed_users and remote_request and not public_line_webhook:
-            if not allowed_tailscale_identity(request):
+        security_class = endpoint_security(request.method, request.url.path)
+        remote_request = is_remote_connection(request)
+        if remote_request and security_class is not EndpointSecurity.PUBLIC_SIGNED_WEBHOOK:
+            if security_class is EndpointSecurity.LOCAL_ONLY:
                 response = JSONResponse(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    content={"detail": "This Tailscale identity is not allowed"},
+                    content={"detail": "This endpoint is available on loopback only"},
+                )
+            elif security_class is EndpointSecurity.WORKER_TOKEN:
+                response = await call_next(request)
+            elif (
+                (identity := trusted_remote_identity(request)) is None
+            ):
+                response = JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "A trusted Tailscale identity is required"},
                 )
             elif (
-                configured.require_remote_passkey
-                and request.url.path.startswith("/api/")
+                not configured.require_remote_passkey
+                or not configured.webauthn_rp_id
+            ):
+                response = JSONResponse(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    content={"detail": "Remote passkey enforcement is not safely configured"},
+                )
+            elif (
+                request.url.path.startswith("/api/")
                 and request.url.path not in remote_passkey_exempt_paths
                 and passkey_session(request) is None
             ):
@@ -678,9 +796,11 @@ def create_app(
                     },
                 )
             else:
+                request.state.remote_identity = identity
                 response = await call_next(request)
         else:
             response = await call_next(request)
+        response.headers["X-Personal-Agent-Security-Class"] = security_class.value
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
             "form-action 'self'; object-src 'none'; script-src 'self'; "
@@ -943,14 +1063,15 @@ def create_app(
 
     @app.websocket("/api/channels/voice/ws")
     async def voice_websocket(websocket: WebSocket) -> None:
-        if configured.tailscale_allowed_users and not is_loopback_connection(websocket):
-            if not allowed_tailscale_identity(websocket):
-                await websocket.close(code=1008, reason="Tailscale identity is not allowed")
+        if is_remote_connection(websocket):
+            if trusted_remote_identity(websocket) is None:
+                await websocket.close(code=1008, reason="Trusted Tailscale identity is required")
                 return
             session_token = websocket.cookies.get(runtime.strong_auth.cookie_name)
             if (
-                configured.require_remote_passkey
-                and runtime.strong_auth.authenticate_session(session_token) is None
+                not configured.require_remote_passkey
+                or not configured.webauthn_rp_id
+                or runtime.strong_auth.authenticate_session(session_token) is None
             ):
                 await websocket.close(code=1008, reason="Passkey sign-in is required")
                 return

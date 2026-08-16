@@ -36,3 +36,16 @@ def test_parse_proxy_v1_rejects_malformed_input(line: bytes) -> None:
     proxy = load_proxy_module()
     with pytest.raises(ValueError, match="PROXY"):
         proxy.parse_proxy_v1_line(line)
+
+
+def test_proxy_source_strips_client_supplied_identity_and_forwarding_headers() -> None:
+    source = (
+        Path(__file__).parents[1] / "scripts" / "windows-tls-proxy.py"
+    ).read_text()
+    for protected_header in (
+        '"tailscale-user-login"',
+        '"x-forwarded-for"',
+        '"x-forwarded-proto"',
+        '"x-personal-agent-remote-proxy"',
+    ):
+        assert protected_header in source

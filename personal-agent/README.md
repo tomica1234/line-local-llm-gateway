@@ -16,6 +16,8 @@ Phase別の対応範囲は [docs/implementation-status.md](docs/implementation-s
 - 時刻、タイマー、アラーム、状態確認、停止をQwenなしのTier 0で処理
 - その他の依頼をOpenAI互換のローカルQwen endpointへ送るDeep Path
 - Mutation ToolのIdempotency Key、Dry-run、型検証、Policy判定、監査
+- stepごとに固定したTool/permission/riskと、Tool Brokerでの`required_permissions`強制
+- 外部Web・メール・ファイル内容から後続stepの権限を増やせないCapability Plan
 - 永続Timer/AlarmとVoice/PWAへのclaim・ack型通知配信
 - Global Pause、Finance Lock、Browser Lock、Secret Lock
 - LINE webhookの署名検証、Primary User限定、Webhook再送の重複排除
@@ -29,13 +31,14 @@ Phase別の対応範囲は [docs/implementation-status.md](docs/implementation-s
 - Windows Playwright Worker、6用途別Persistent Chrome Profile、通常表示Chrome
 - 型付きBrowser Primitive、DOM参照ID、DOM→mask済みScreenshot→座標操作の強制順序
 - finance allowlist、隔離Download、Mutation Idempotency、Human Takeover lock
-- Qwen tool-call loopとTask単位のBrowser/Auth Tool allowlist（最大12 step）
+- trackedなQwen Chat Completions clientとstep-scoped tool-call loop（最大12 turn）
 - Windows user-scoped DPAPI Secret Store、Origin/Action binding、TOTP direct-fill
 - `auth.ensure_authenticated`、既存Session優先、曖昧Account停止、OTP Task binding
 - 1回限りの承認Grant、WebAuthn UVによるR4/R5承認、PWA承認/OTP/Secret履歴
 - LINE/Slack/Gmailを共通形式へ正規化し、検索・thread取得・下書き・送信を分離
 - Slack/Gmail tokenをCoreやLLMへ渡さないPrivileged Connector Worker
 - ローカルCalendarの検索・空き時間・作成・更新・取消と永続Scheduler
+- Agent実行Taskとは別tableのPersonalTodoと構造化Diary、Asia/Tokyoの深夜business date
 - Economic Action、確定見積、Budget、Payee、Sandbox送金、照合、`SUBMITTED_UNKNOWN`
 - allowlist root内だけのFile検索・読取・コピー・移動・改名・回収可能な削除
 - Home Assistantの状態取得・照明・温度・Scene（lock/alarmはfail-closed）
@@ -44,7 +47,8 @@ Phase別の対応範囲は [docs/implementation-status.md](docs/implementation-s
 - System Health、モデル/tool latency、監査検索、暗号化backup、秘密を含まないexport、範囲削除
 - 17カテゴリのdry-run Benchmark HarnessとPWA管理画面
 
-外部Mutationは、Worker Token、Safety Lock、Risk Policy、承認、Evidenceを通過した場合だけ
+外部Mutationは、stepでToolが公開され、必要permissionがgrantされ、Worker Token、Safety Lock、
+Risk Policy、承認、Evidenceを通過した場合だけ
 実行します。購入・予約は型付きBrowser操作とEconomic Intentで実現できる構成ですが、
 実サイトごとの専用Adapterは同梱していません。実銀行への送金は意図的に未接続で、
 Money機能はSandboxだけです。実行していないDeep Pathは
@@ -64,7 +68,7 @@ Voice text / LINE webhook / Web PWA
         │                   │
         └─────────┬─────────┘
                   ▼
-        Policy → Tool Broker
+ Step Capability → Policy → Tool Broker
                   │
                   ▼
  SQLite Task / Action / Audit / FTS Memory / Calendar / Economic Intent
@@ -281,12 +285,18 @@ Tool名、正規化済み引数hash、表示した要約、Risk、期限、nonce
 user-presence/user-verification flag、sign counterを検証してから1回だけ承認Grantを消費します。
 Admin TokenだけではR4/R5を承認できません。WebAuthn未設定またはpasskey未登録時はfail-closedです。
 
-遠隔PWAはさらに、Tailscale Serveが付与するidentity、または送信元をPROXY protocolで検証した
+遠隔PWAはさらに、loopbackへ到達するTailscale Serveが付与するidentity、または送信元をPROXY protocolで検証した
 Tailnet限定TLS proxyのidentityを`PERSONAL_AGENT_TAILSCALE_ALLOWED_USERS`と完全一致で照合します。
 Coreはloopbackにしかbindせず、許可したTailscale identity以外はPWA本体を含め403で拒否します。
 許可identityでも、初回passkey登録用endpoint以外の遠隔HTTP APIとVoice WebSocketは、有効な
 Secure/HttpOnly passkey sessionがなければ拒否します。
 したがってAdmin Tokenはbootstrap authorityであり、通常の遠隔API bearer tokenとしては使えません。
+
+Coreを`100.64.0.0/10`へ直接bindする構成は例外扱いです。この場合はallowed user、remote passkey、
+exact WebAuthn設定に加え、`PERSONAL_AGENT_TAILSCALE_PEER_IDENTITIES`へTailscale source IPとidentityの
+固定対応を設定しない限り起動を拒否します。直接接続ではクライアントが送った
+`Tailscale-User-Login`やproxy markerをidentity根拠として使いません。通常運用ではこの対応表を空にし、
+Coreをloopbackのままtrusted proxy経由で利用してください。
 
 iPhoneを含む初回設定は [docs/iphone-setup.md](docs/iphone-setup.md) を参照してください。最初の
 passkey登録だけはAdmin Tokenが必要で、2本目以降は登録済みpasskey sessionで許可します。
@@ -615,6 +625,13 @@ Benchmark、WebAuthn challenge binding・有効期限・single-use・passkey ses
 - PC操作は状態取得・永続通知・Windows workstation lockに限定し、任意shellや任意app起動はしません。
 - Wake Word/STT/TTS、Qwen、Chrome、Home Assistant、LINE、Slack、Gmailは対応する実機・model・
   credentialを用意して初めてend-to-endで動作します。
+
+## CIとローカル検証
+
+GitHub ActionsはPython 3.11/3.12で`pip install -e '.[dev]'`、`ruff check .`、`pytest`、
+`python -m compileall -q src`を実行します。Windows/DPAPI/Windows Hello/実ブラウザはLinux CIで
+実機E2Eせず、unit testではfakeまたはmockを使います。ローカル仮想環境`.venv/`、`.env`、SQLite DB、
+GGUF modelはGit管理対象外です。
 
 実口座、実カード、実購入先へ拡張する場合は、専用Adapter、strong-auth、Sandbox回帰試験、
 Prompt Injection試験、provider固有の照合を追加してからSafety Lockを解除してください。

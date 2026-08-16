@@ -121,6 +121,7 @@ def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
             args_model=SearchArgs,
             handler=search,
             risk_level=RiskLevel.R0,
+            required_permissions=("calendar.read",),
         ),
         ToolDefinition(
             name="calendar.get_availability",
@@ -128,6 +129,7 @@ def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
             args_model=AvailabilityArgs,
             handler=availability,
             risk_level=RiskLevel.R0,
+            required_permissions=("calendar.read",),
         ),
         ToolDefinition(
             name="calendar.create",

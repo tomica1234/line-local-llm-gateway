@@ -156,7 +156,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             for name, value in self.headers.items()
             if name.casefold() not in HOP_BY_HOP_HEADERS
             and name.casefold()
-            not in {"content-length", "tailscale-user-login", "x-personal-agent-remote-proxy"}
+            not in {
+                "content-length",
+                "tailscale-user-login",
+                "x-forwarded-for",
+                "x-forwarded-proto",
+                "x-personal-agent-remote-proxy",
+            }
         }
         headers["Host"] = self.headers.get("Host", "")
         headers["Tailscale-User-Login"] = self.proxy_server.tailscale_login

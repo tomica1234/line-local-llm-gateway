@@ -236,6 +236,7 @@ async def test_finance_lock_blocks_all_economic_execution_before_store(tmp_path:
         dry_run=False,
         reason="verify finance lock",
         allowed_names={"economic.create_intent"},
+        granted_permissions={"economic.prepare"},
     )
 
     assert denied.status == "denied"

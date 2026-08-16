@@ -77,6 +77,7 @@ def home_tools(client: HomeAssistantClient) -> list[ToolDefinition[Any]]:
             args_model=EntityArgs,
             handler=get_state,
             risk_level=RiskLevel.R0,
+            required_permissions=("home.read",),
         ),
         ToolDefinition(
             name="home.turn_on",
@@ -85,6 +86,7 @@ def home_tools(client: HomeAssistantClient) -> list[ToolDefinition[Any]]:
             handler=service_handler("turn_on"),
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("home.write",),
         ),
         ToolDefinition(
             name="home.turn_off",
@@ -93,6 +95,7 @@ def home_tools(client: HomeAssistantClient) -> list[ToolDefinition[Any]]:
             handler=service_handler("turn_off"),
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("home.write",),
         ),
         ToolDefinition(
             name="home.set_temperature",
@@ -101,6 +104,7 @@ def home_tools(client: HomeAssistantClient) -> list[ToolDefinition[Any]]:
             handler=set_temperature,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("home.write",),
         ),
         ToolDefinition(
             name="home.run_scene",
@@ -109,5 +113,6 @@ def home_tools(client: HomeAssistantClient) -> list[ToolDefinition[Any]]:
             handler=run_scene,
             risk_level=RiskLevel.R2,
             mutation=True,
+            required_permissions=("home.write",),
         ),
     ]

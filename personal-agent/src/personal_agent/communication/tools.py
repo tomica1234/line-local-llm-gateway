@@ -146,6 +146,7 @@ def communication_tools(service: CommunicationService) -> list[ToolDefinition[An
             args_model=SearchArgs,
             handler=search,
             risk_level=RiskLevel.R0,
+            required_permissions=("messages.read",),
         ),
         ToolDefinition(
             name="communication.read",
@@ -153,6 +154,7 @@ def communication_tools(service: CommunicationService) -> list[ToolDefinition[An
             args_model=ReadArgs,
             handler=read,
             risk_level=RiskLevel.R0,
+            required_permissions=("messages.read",),
         ),
         ToolDefinition(
             name="communication.thread",
@@ -160,6 +162,7 @@ def communication_tools(service: CommunicationService) -> list[ToolDefinition[An
             args_model=ThreadArgs,
             handler=thread,
             risk_level=RiskLevel.R0,
+            required_permissions=("messages.read",),
         ),
         ToolDefinition(
             name="communication.draft",

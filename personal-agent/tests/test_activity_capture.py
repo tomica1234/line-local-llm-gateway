@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
@@ -103,3 +104,19 @@ def test_activity_privacy_domain_blocking_and_url_sanitization(
     }
     assert sensitive["source_reference"] == "https://secure.bank.example"
     assert not any("保存禁止" in event["content"] for event in events)
+
+    storage = client.app.state.runtime.storage
+    with storage.read_connection() as connection:
+        row = connection.execute(
+            "SELECT content, payload_json, source_reference, provenance_json "
+            "FROM raw_events WHERE event_id=?",
+            (sensitive["event_id"],),
+        ).fetchone()
+    persisted = json.dumps(dict(row), ensure_ascii=False)
+    for forbidden in (
+        "/transfer",
+        "token=secret",
+        "振込画面",
+        "example.test",
+    ):
+        assert forbidden not in persisted

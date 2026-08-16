@@ -24,6 +24,16 @@ def _csv_env(name: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
 
 
+def _peer_identities_env(name: str) -> tuple[tuple[str, str], ...]:
+    mappings: list[tuple[str, str]] = []
+    for item in _csv_env(name):
+        address, separator, identity = item.partition("=")
+        if not separator:
+            raise ValueError(f"{name} entries must use Tailscale-IP=user@example.com")
+        mappings.append((address.strip(), identity.strip().casefold()))
+    return tuple(mappings)
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     host: str = "127.0.0.1"
@@ -44,6 +54,7 @@ class Settings:
     webauthn_challenge_ttl_seconds: int = 300
     webauthn_session_ttl_hours: int = 12
     tailscale_allowed_users: tuple[str, ...] = ()
+    tailscale_peer_identities: tuple[tuple[str, str], ...] = ()
     require_remote_passkey: bool = True
     admin_token: str = ""
     activity_token: str = ""
@@ -100,6 +111,9 @@ class Settings:
             ),
             tailscale_allowed_users=tuple(
                 value.casefold() for value in _csv_env("PERSONAL_AGENT_TAILSCALE_ALLOWED_USERS")
+            ),
+            tailscale_peer_identities=_peer_identities_env(
+                "PERSONAL_AGENT_TAILSCALE_PEER_IDENTITIES"
             ),
             require_remote_passkey=_bool_env(
                 "PERSONAL_AGENT_REQUIRE_REMOTE_PASSKEY", default=True
@@ -198,6 +212,27 @@ class Settings:
                 raise ValueError(
                     "PERSONAL_AGENT_TAILSCALE_ALLOWED_USERS contains an invalid identity"
                 )
+        peer_addresses: set[str] = set()
+        for address_text, identity in self.tailscale_peer_identities:
+            try:
+                address = ipaddress.ip_address(address_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "PERSONAL_AGENT_TAILSCALE_PEER_IDENTITIES contains an invalid IP"
+                ) from exc
+            if address not in ipaddress.ip_network("100.64.0.0/10"):
+                raise ValueError(
+                    "PERSONAL_AGENT_TAILSCALE_PEER_IDENTITIES must contain Tailscale IPv4 peers"
+                )
+            normalized_address = str(address)
+            if normalized_address in peer_addresses:
+                raise ValueError("Tailscale peer identities must use unique IP addresses")
+            peer_addresses.add(normalized_address)
+            if identity not in self.tailscale_allowed_users:
+                raise ValueError(
+                    "Every Tailscale peer identity must be present in allowed users"
+                )
+        self.validate_remote_bind_security()
         if len(self.admin_token) < 32:
             raise ValueError("PERSONAL_AGENT_ADMIN_TOKEN must contain at least 32 characters")
         for name, value in {
@@ -229,6 +264,36 @@ class Settings:
             raise ValueError(
                 "PERSONAL_AGENT_LINE_PRIMARY_USER_ID must be a Messaging API user ID"
             )
+
+    def validate_remote_bind_security(self) -> None:
+        try:
+            bind_address = ipaddress.ip_address(self.host)
+        except ValueError:
+            return
+        if bind_address not in ipaddress.ip_network("100.64.0.0/10"):
+            return
+        self.validate_webauthn()
+        if not self.tailscale_allowed_users:
+            raise ValueError(
+                "Direct Tailscale bind requires PERSONAL_AGENT_TAILSCALE_ALLOWED_USERS"
+            )
+        if not self.require_remote_passkey:
+            raise ValueError("Direct Tailscale bind requires remote passkey enforcement")
+        if not self.webauthn_rp_id or not self.webauthn_origin:
+            raise ValueError("Direct Tailscale bind requires WebAuthn configuration")
+        if not self.tailscale_peer_identities:
+            raise ValueError(
+                "Direct Tailscale bind requires a trusted Tailscale peer identity mapping"
+            )
+        for address_text, identity in self.tailscale_peer_identities:
+            try:
+                peer_address = ipaddress.ip_address(address_text)
+            except ValueError as exc:
+                raise ValueError("Direct Tailscale peer mapping contains an invalid IP") from exc
+            if peer_address not in ipaddress.ip_network("100.64.0.0/10"):
+                raise ValueError("Direct Tailscale peer mapping must contain Tailscale IPv4 peers")
+            if identity not in self.tailscale_allowed_users:
+                raise ValueError("Direct Tailscale peer identity is not in allowed users")
 
     def validate_webauthn(self) -> None:
         if bool(self.webauthn_rp_id) != bool(self.webauthn_origin):

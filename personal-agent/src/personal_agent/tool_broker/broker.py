@@ -25,6 +25,8 @@ class ToolContext:
     dry_run: bool
     reason: str
     risk_level: RiskLevel
+    step_id: str | None = None
+    granted_permissions: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,10 +56,20 @@ class ToolBroker:
             raise ValueError(f"Tool already registered: {definition.name}")
         self._tools[definition.name] = definition
 
-    def schemas(self, allowed_names: set[str] | None = None) -> list[dict[str, Any]]:
+    def schemas(
+        self,
+        allowed_names: set[str] | None = None,
+        granted_permissions: set[str] | frozenset[str] | None = None,
+    ) -> list[dict[str, Any]]:
         definitions = self._tools.values()
         if allowed_names is not None:
             definitions = [tool for tool in definitions if tool.name in allowed_names]
+        if granted_permissions is not None:
+            definitions = [
+                tool
+                for tool in definitions
+                if set(tool.required_permissions).issubset(granted_permissions)
+            ]
         return [
             {
                 "name": tool.name,
@@ -75,6 +87,12 @@ class ToolBroker:
             raise ToolNotAvailable(tool_name)
         return definition.mutation
 
+    def required_permissions(self, tool_name: str) -> frozenset[str]:
+        definition = self._tools.get(tool_name)
+        if definition is None:
+            raise ToolNotAvailable(tool_name)
+        return frozenset(definition.required_permissions)
+
     async def execute(
         self,
         *,
@@ -85,10 +103,55 @@ class ToolBroker:
         dry_run: bool,
         reason: str,
         allowed_names: set[str],
+        granted_permissions: set[str] | frozenset[str] = frozenset(),
+        step_id: str | None = None,
     ) -> ToolResult:
-        if tool_name not in allowed_names or tool_name not in self._tools:
+        if tool_name not in self._tools:
             raise ToolNotAvailable(tool_name)
         tool = self._tools[tool_name]
+        required = frozenset(tool.required_permissions)
+        granted = frozenset(granted_permissions)
+        if tool_name not in allowed_names:
+            self._record_capability_decision(
+                task_id=task_id,
+                tool_name=tool_name,
+                required=required,
+                granted=granted,
+                decision="denied",
+                reason_code="TOOL_NOT_EXPOSED",
+                step_id=step_id,
+            )
+            return ToolResult(
+                status="denied",
+                evidence={"reason_code": "TOOL_NOT_EXPOSED"},
+            )
+        if not required.issubset(granted):
+            self._record_capability_decision(
+                task_id=task_id,
+                tool_name=tool_name,
+                required=required,
+                granted=granted,
+                decision="denied",
+                reason_code="PERMISSION_NOT_GRANTED",
+                step_id=step_id,
+            )
+            return ToolResult(
+                status="denied",
+                evidence={
+                    "reason_code": "PERMISSION_NOT_GRANTED",
+                    "required_permissions": sorted(required),
+                    "granted_permissions": sorted(granted),
+                },
+            )
+        self._record_capability_decision(
+            task_id=task_id,
+            tool_name=tool_name,
+            required=required,
+            granted=granted,
+            decision="allowed",
+            reason_code="CAPABILITY_GRANTED",
+            step_id=step_id,
+        )
         args = tool.args_model.model_validate(arguments)
         audited_arguments = self._audit_arguments(tool_name, args.model_dump(mode="json"))
         decision = self.policy.evaluate(tool_name=tool_name, risk_level=tool.risk_level)
@@ -102,6 +165,10 @@ class ToolBroker:
                 "risk_level": tool.risk_level.value,
                 "reason_code": decision.reason_code,
                 "policy_version": decision.policy_version,
+                "step_id": step_id,
+                "required_permissions": sorted(required),
+                "granted_permissions": sorted(granted),
+                "decision": decision.outcome.value,
             },
         )
         if decision.outcome is PolicyOutcome.DENY:
@@ -180,6 +247,8 @@ class ToolBroker:
             dry_run=dry_run,
             reason=reason,
             risk_level=tool.risk_level,
+            step_id=step_id,
+            granted_permissions=granted,
         )
         if dry_run and tool.mutation:
             result = ToolResult(
@@ -215,9 +284,39 @@ class ToolBroker:
                 "output": result.model_dump(mode="json"),
                 "reason": reason,
                 "duration_ms": duration_ms if not (dry_run and tool.mutation) else 0,
+                "step_id": step_id,
+                "required_permissions": sorted(required),
+                "granted_permissions": sorted(granted),
+                "decision": "executed",
             },
         )
         return result
+
+    def _record_capability_decision(
+        self,
+        *,
+        task_id: str,
+        tool_name: str,
+        required: frozenset[str],
+        granted: frozenset[str],
+        decision: str,
+        reason_code: str,
+        step_id: str | None,
+    ) -> None:
+        self.audit.record(
+            task_id=task_id,
+            actor="tool_broker",
+            action="capability.evaluate",
+            result=decision,
+            details={
+                "tool": tool_name,
+                "required_permissions": sorted(required),
+                "granted_permissions": sorted(granted),
+                "decision": decision,
+                "reason_code": reason_code,
+                "step_id": step_id,
+            },
+        )
 
     @staticmethod
     def _audit_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:

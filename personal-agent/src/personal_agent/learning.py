@@ -270,5 +270,6 @@ def learning_tools(service: LearningService) -> list[ToolDefinition[Any]]:
             handler=propose,
             risk_level=RiskLevel.R1,
             mutation=True,
+            required_permissions=("learning.propose",),
         )
     ]

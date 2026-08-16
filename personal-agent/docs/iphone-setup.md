@@ -48,6 +48,13 @@ systemctl --user status personal-agent.service
 systemctl --user status personal-agent-qwen.service
 ```
 
+CoreをTailscale IPへ直接bindする例外構成では、次も必要です。source IPとidentityが固定対応しない
+設定ではCoreが起動を拒否します。通常のloopback TLS proxy構成では空のままにしてください。
+
+```text
+PERSONAL_AGENT_TAILSCALE_PEER_IDENTITIES=100.64.0.10=you@example.com
+```
+
 ## 2. MagicDNS
 
 iPhoneでraw Tailscale IPへ接続できるのに`.ts.net`名だけ失敗する場合、Tailscale DNS管理画面で

@@ -205,13 +205,16 @@ def test_remote_api_requires_allowed_tailscale_identity_and_passkey(
         webauthn_rp_id="agent.example.test",
         webauthn_origin="https://agent.example.test",
         tailscale_allowed_users=("owner@example.com",),
+        tailscale_peer_identities=(("100.64.0.10", "owner@example.com"),),
         require_remote_passkey=True,
     )
     app = create_app(settings, Model())
     owner_header = {"Tailscale-User-Login": "OWNER@example.com"}
 
     with TestClient(app, client=("100.64.0.10", 50000)) as remote:
-        assert remote.get("/").status_code == 403
+        # Direct binds use the configured Tailscale source-IP identity mapping;
+        # the client-supplied identity header is not an authority.
+        assert remote.get("/").status_code == 200
         assert remote.get("/api/health", headers=owner_header).status_code == 200
         assert remote.get("/", headers=owner_header).status_code == 200
         blocked = remote.post(
@@ -271,8 +274,11 @@ def test_remote_api_requires_allowed_tailscale_identity_and_passkey(
                 },
                 json={"text": "今何時？", "source": "web", "conversation_id": "iphone"},
             ).status_code
-            == 403
+            == 200
         )
+
+    with TestClient(app, client=("100.64.0.11", 50002)) as unknown_peer:
+        assert unknown_peer.get("/", headers=owner_header).status_code == 403
 
     with TestClient(app, client=("127.0.0.1", 50001)) as local:
         assert (
@@ -287,6 +293,7 @@ def test_remote_api_requires_allowed_tailscale_identity_and_passkey(
             headers={
                 "Tailscale-User-Login": "owner@example.com",
                 "X-Personal-Agent-Remote-Proxy": "tailscale-direct-tls-v1",
+                "X-Forwarded-For": "100.64.0.10",
             },
             json={"text": "今何時？", "source": "web", "conversation_id": "tls-proxy"},
         )
