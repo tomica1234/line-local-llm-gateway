@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..approval import ApprovalMaterial
 from ..tool_broker.broker import ToolContext, ToolDefinition
 from ..types import RiskLevel, ToolResult
 from .models import CommunicationSource, DraftCreate
@@ -52,6 +53,41 @@ class SyncArgs(BaseModel):
 
 
 def communication_tools(service: CommunicationService) -> list[ToolDefinition[Any]]:
+    def send_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = SendArgs.model_validate(args)
+        try:
+            draft = service.store.get_draft(parsed.draft_id)
+        except KeyError:
+            return ApprovalMaterial.create(
+                action_type="communication.send",
+                title="送信できない下書き",
+                human_summary=(
+                    "指定された下書きは現在存在しません。承認しても送信処理は実行できません。"
+                ),
+                structured_payload={
+                    "draft_id": parsed.draft_id,
+                    "draft_status": "missing",
+                    "actual_destination": None,
+                    "body": None,
+                },
+            )
+        payload = {
+            "provider": draft.source.value,
+            "recipient_entity": draft.recipient_entity_id,
+            "actual_destination": draft.conversation_id,
+            "subject": draft.subject,
+            "body": draft.text,
+            "thread": draft.thread_id,
+            "reply_target": draft.reply_to,
+            "attachments": [item.model_dump(mode="json") for item in draft.attachments],
+        }
+        return ApprovalMaterial.create(
+            action_type="communication.send",
+            title=f"{draft.source.value}でメッセージを送信",
+            human_summary=(f"宛先 {draft.conversation_id} へ、表示された本文を1回だけ送信します。"),
+            structured_payload=payload,
+        )
+
     def search(args: BaseModel, _context: ToolContext) -> ToolResult:
         parsed = SearchArgs.model_validate(args)
         hits = service.store.search(parsed.query, limit=parsed.limit)
@@ -184,6 +220,7 @@ def communication_tools(service: CommunicationService) -> list[ToolDefinition[An
             risk_level=RiskLevel.R2,
             mutation=True,
             required_permissions=("messages.write",),
+            approval_material_builder=send_material,
         ),
         ToolDefinition(
             name="communication.sync",

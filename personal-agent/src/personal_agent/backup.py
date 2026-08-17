@@ -6,7 +6,7 @@ import os
 import sqlite3
 import struct
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .secret.protection import SecretProtector
@@ -62,6 +62,86 @@ class EncryptedBackupService:
     def inspect(self, backup: Path) -> dict[str, object]:
         metadata, _ = self._read(backup)
         return metadata
+
+    def verify(self, backup: Path) -> dict[str, object]:
+        metadata, ciphertext = self._read(backup)
+        plaintext = self.protector.unprotect(ciphertext)
+        digest = hashlib.sha256(plaintext).hexdigest()
+        if digest != metadata.get("plaintext_sha256"):
+            raise ValueError("Backup integrity digest does not match")
+        with tempfile.NamedTemporaryFile(
+            prefix=".personal-agent-verify-", suffix=".sqlite3", delete=False
+        ) as file:
+            file.write(plaintext)
+            file.flush()
+            verify_path = Path(file.name)
+        try:
+            with sqlite3.connect(verify_path) as connection:
+                integrity = str(connection.execute("PRAGMA integrity_check").fetchone()[0])
+        finally:
+            verify_path.unlink(missing_ok=True)
+        if integrity != "ok":
+            raise ValueError(f"Backup SQLite integrity check failed: {integrity}")
+        return {
+            **metadata,
+            "backup": str(backup.resolve(strict=True)),
+            "integrity": integrity,
+            "verified": True,
+        }
+
+    def create_automated(
+        self,
+        source: Path,
+        backup_root: Path,
+        *,
+        retention_count: int,
+        retention_days: int,
+    ) -> dict[str, object]:
+        if retention_count < 1 or retention_days < 1:
+            raise ValueError("Backup retention count and days must be positive")
+        backup_root = backup_root.resolve(strict=False)
+        self._validate_local_path(backup_root)
+        backup_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        destination = backup_root / f"personal-agent-{stamp}.pab"
+        created = self.create(source, destination)
+        verification = self.verify(destination)
+        removed = self.prune(
+            backup_root,
+            retention_count=retention_count,
+            retention_days=retention_days,
+            preserve={destination},
+        )
+        return {**created, "verification": verification, "pruned": removed}
+
+    def prune(
+        self,
+        backup_root: Path,
+        *,
+        retention_count: int,
+        retention_days: int,
+        preserve: set[Path] | None = None,
+    ) -> list[str]:
+        root = backup_root.resolve(strict=True)
+        self._validate_local_path(root)
+        preserved = {item.resolve(strict=False) for item in (preserve or set())}
+        candidates = sorted(
+            (item for item in root.glob("personal-agent-*.pab") if item.is_file()),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        )
+        cutoff = datetime.now(UTC) - timedelta(days=retention_days)
+        removed: list[str] = []
+        for index, path in enumerate(candidates):
+            if path.resolve() in preserved:
+                continue
+            modified = datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            if index >= retention_count or modified < cutoff:
+                # Only files with our authenticated backup header are retention candidates.
+                self.inspect(path)
+                path.unlink()
+                removed.append(path.name)
+        return removed
 
     def restore(
         self,

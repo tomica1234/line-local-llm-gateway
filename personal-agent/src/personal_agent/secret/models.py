@@ -7,14 +7,14 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 class SecretKind(StrEnum):
     USERNAME = "username"
-    PASSWORD = "password"
+    PASSWORD = "password"  # pragma: allowlist secret
     TOTP_SEED = "totp_seed"
     API_TOKEN = "api_token"
 
 
 class SecretAction(StrEnum):
     USERNAME_FILL = "username_fill"
-    PASSWORD_FILL = "password_fill"
+    PASSWORD_FILL = "password_fill"  # pragma: allowlist secret
     TOTP_FILL = "totp_fill"
     CONNECTOR_REQUEST = "connector_request"
 

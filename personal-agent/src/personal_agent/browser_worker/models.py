@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -125,7 +126,42 @@ class ScrollParams(StrictParams):
         return self
 
 
+class TransactionApproval(StrictParams):
+    provider_or_site: str = Field(min_length=1, max_length=500)
+    item_or_service: str = Field(min_length=1, max_length=2_000)
+    quantity: int = Field(default=1, ge=1, le=1_000)
+    seller: str = Field(min_length=1, max_length=1_000)
+    unit_price: Decimal = Field(ge=0, max_digits=18, decimal_places=2)
+    shipping: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    fee: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    tax: Decimal = Field(default=Decimal("0"), ge=0, max_digits=18, decimal_places=2)
+    total: Decimal = Field(gt=0, max_digits=18, decimal_places=2)
+    currency: str = Field(default="JPY", pattern=r"^[A-Z]{3}$")
+    delivery_or_reservation_date: str | None = Field(default=None, max_length=200)
+    cancellation_policy: str = Field(min_length=1, max_length=10_000)
+    payment_method_reference: str | None = Field(
+        default=None, pattern=r"^secret://[a-z0-9][a-z0-9._/-]{2,200}$"
+    )
+
+    @model_validator(mode="after")
+    def require_exact_total(self) -> TransactionApproval:
+        expected = self.unit_price * self.quantity + self.shipping + self.fee + self.tax
+        if expected != self.total:
+            raise ValueError("Transaction total does not match its components")
+        return self
+
+
 class SubmitParams(RefParams):
+    # Core-originated submits always provide these approval fields. Defaults preserve
+    # compatibility for direct worker recovery tests; the worker never grants approval.
+    origin: str = Field(default="", max_length=2_000)
+    page_title: str = Field(default="", max_length=500)
+    action_target: str = Field(default="", max_length=500)
+    submit_target: str = Field(default="", max_length=500)
+    nonsecret_inputs: dict[str, str | int | float | bool | None] = Field(
+        default_factory=dict, max_length=100
+    )
+    transaction: TransactionApproval | None = None
     expected_text: str | None = Field(default=None, min_length=2, max_length=200)
     expected_url_prefix: str | None = Field(default=None, min_length=10, max_length=2_000)
     timeout_ms: int = Field(default=10_000, ge=500, le=30_000)

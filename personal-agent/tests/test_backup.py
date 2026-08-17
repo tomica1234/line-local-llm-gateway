@@ -55,3 +55,20 @@ def test_backup_rejects_overwrite_and_invalid_format(tmp_path: Path) -> None:
         service.create(source, destination)
     with pytest.raises(ValueError, match="Not a Personal Agent"):
         service.inspect(destination)
+
+
+def test_automated_backup_is_verified_and_pruned(tmp_path: Path) -> None:
+    source = tmp_path / "source.sqlite3"
+    with sqlite3.connect(source) as connection:
+        connection.execute("CREATE TABLE notes(value TEXT)")
+        connection.execute("INSERT INTO notes VALUES ('verified')")
+    root = tmp_path / "backups"
+    service = EncryptedBackupService(ReversingProtector())
+
+    first = service.create_automated(source, root, retention_count=1, retention_days=30)
+    second = service.create_automated(source, root, retention_count=1, retention_days=30)
+
+    assert first["verification"]["verified"] is True
+    assert second["verification"]["integrity"] == "ok"
+    assert len(list(root.glob("*.pab"))) == 1
+    assert second["pruned"]

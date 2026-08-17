@@ -1,131 +1,133 @@
-# 要件対応状況（v0.1）
+# Personal Agent 実装・検証状況
 
-この文書は要件定義のPhaseごとの実装範囲を示します。「実装済み」は自動テスト済みの
-software境界を意味し、外部credential・実機・第三者serviceまで含む運用保証ではありません。
+更新日: 2026-08-17
 
-## Phase 0〜2: Core・Channel・Memory（実装済み）
+ここでは「コードがある」「自動テスト済み」「本人のcredential/実機で確認済み」を分けます。
+Alexaと実銀行送金は今回のscope外です。
 
-- SQLite Durable Task State、checkpoint、再起動時の安全なPause、Pause/Resume/Cancel
-- 型付きTool Broker、決定論的Policy、Risk、Reason Code、Policy version、4種Safety Lock
-- Toolごとのrequired permission強制、step-scoped Tool/permission/risk、grant判断のAudit
-- Mutation Idempotency、Dry-run、single-use Approval、Secret redaction付きAudit
-- trackedなloopback限定OpenAI互換Qwen client、Tier 0、最大12 turnのDeep Tool loop
-- Agent実行Taskと分離したPersonalTodo/Diary table・型付きTool・Asia/Tokyo business date
-- Responsive PWA（Chat処理中・経過秒・完了/失敗表示）、LINE署名/Primary User/再送排除、
-  Voice HTTP/WebSocket contract
-- openWakeWord、Energy VAD、whisper.cpp、Piperを接続するWindows Voice Gateway
-- channelをまたぐTask継続、永続Timer/Alarm、claim/ack型通知、PWAとLINEへの独立fan-out
-- 共通Raw Event、FTS5 trigram検索、Entity、Preference、Decision、Evidence付きMemory
-- 90日Raw Event retention、日次要約、低重要度Memory decay
-- Safari Private Activity Web Extension、AES-GCM offline queue、Sensitive URL最小化
+## 実装済み
 
-## Phase 3〜4: Browser・Auth・Secret・Takeover（実装済み）
+### Safety / durability
 
-- Windows Playwright Worker、6用途別Persistent Chrome Profile、共有token認証
-- Windows headed Chrome常駐Worker、WSL仮想NIC限定Firewall、動的WSL host解決
-- 型付きBrowser Primitive、DOM ref、mask済みScreenshot、座標操作の順序強制
-- tab/history/hover/key/scrollと、送信後条件を検証し不明時に再送しないBrowser submit
-- navigation SSRF防止、finance allowlist、upload root、隔離Download、SHA-256
-- Core/Worker二重Idempotency、送信不明時の `SUBMITTED_UNKNOWN` と再送停止
-- CAPTCHA/Passkey/biometric/3DS検出、同じContextのHuman Takeover、timeout lock
-- Windows user-scoped DPAPI Secret Store、PWA書込専用credential登録、username/password/TOTPの
-  exact Origin/Action bindingとdirect-fill
-- Password/OTPをCore・LLM・HTTP responseへ返さないWorker内復号
-- Auth session優先、曖昧account停止、email/SMS OTPの手動入力、Task/期限/試行Binding
-- PWAからApproval、OTP、Profile、Takeover、Secret metadata/利用履歴/失効を管理
-- WebAuthn passkeyをiPhone Face ID / Windows Helloで登録・loginし、R4/R5はActionごとのUV署名で承認
-- exact Origin/RP ID、approval内容hash、有効期限、試行回数、single-use、sign counterを検証
-- Tailscale identityまたは送信元検証済みTLS proxy identityとpasskey sessionを重ね、一般の遠隔APIを二重認証
-- Tailscale直接bindはallowed user/passkey/WebAuthn/source-IP identity mapping不足時に起動拒否
+- communication/calendar/browser/economic/transferを実体表示する`ApprovalMaterial`
+- canonical material hash、実行直前再計算、変更時`APPROVAL_MATERIAL_CHANGED`、single-use
+- Plan/Stepのstatus、入出力、evidence、attempt、model、prompt versionのSQLite永続化
+- 完了step skip、read step resume、in-flight mutationの`SUBMITTED_UNKNOWN`停止
+- Todo reminderのScheduler連携、update時差替え、complete/delete時cancel、snooze、recurrence
+- component別schema migration framework
+- LLM Capability Proposalと、ユーザー原文/allowlist/riskに基づく決定論的validator
 
-## Phase 5: Communication・Calendar・Scheduler（実装済み、一部provider待ち）
+### Productivity / providers
 
-- LINE/Slack/Gmail/SMS共通message model、検索、thread、下書き、送信の分離
-- 個人LINE Desktopは宛先allowlist、送信直前のOCR再照合、送信後OCR検証、不明時再送停止
-- Slack `chat.postMessage` / `search.messages` とGmail messages read/send connector
-- Slack/Gmail tokenをSecret Workerだけで復号し、送信idempotencyと不明状態を記録
-- ローカルCalendarの検索、free/busy、作成、更新、取消、recurrence、reminder
-- Proactive follow-upと朝/夜briefing
+- local/Google Calendar provider、free-busy、CRUD、recurrence、attendee、reminder、paging、同期mapping
+- external version/etagを使う同期と、local変更競合時の自動上書き停止
+- Google OAuth authorization code flow、Secret Worker refresh token保存、自動access-token refresh
+- Gmail thread/label/draft/reply/send verification、添付metadata、50 MiB隔離download
+- Manual/Google/Gmail/LINE/Memory sourceを統合するContactsと曖昧解決停止
+- PDF/DOCX/XLSX/PPTX/HTML/Image/ZIPの非実行解析、PDF table/page、metadata、Vision fallback
+- Today/Todo/Diary/Calendar/Inbox/Files/Tasks/Approvals/Memory/Safety/OpsのPWA画面
+- Chatの処理中表示、経過秒、失敗時入力復元
 
-Google Calendar等の外部Calendar同期、Gmail OAuth refresh、attachment本文の自動取得、
-native SMS Bridgeは未実装です。
+### Model / agent capability
 
-## Phase 6〜7: Shopping・Reservation・Money（安全な基盤とSandboxを実装）
+- Tier 0 deterministic、設定可能なfast、strong Qwen、optional local VisionのModel Registry/Router
+- 補助modelを含むlocal endpoint強制。remote許可はoperator設定だけ
+- DOM/native extraction後だけのVision。Vision結果からpermission追加不可
+- process/app/job/clipboard/desktop/fixed-commandの型付きComputer tool
+- cwd/app/command/env allowlist、timeout、output上限、child cleanup、no shell/no sudo/no secret env
+- allowlisted repo内のCodex job start/send/status/cancel/test、永続job、完了通知
+- Codexはworkspace/read-only sandbox、network off、commit/pushなしを既定にする
 
-- Economic Intent、action type、条件、取消条件、payment ref、risk/evidence
-- 確定見積のitem/数量/価格/送料/fee/合計/通貨/販売元/納期/取消可否の一致検査
-- 共通Budgetの1回・日次・月次上限、30日内の重複購入検知
-- Entityに結び付く登録Payee、信頼状態、1回・日次・月次上限、JPY限定
-- 専用Sandbox残高、Sandbox購入/送金、Idempotency、取引記録、Reconciliation
-- Finance Lock既定ON、実口座補充・Policy上限変更をAgent Toolに公開しない構成
+### Automation
 
-汎用Browserで候補探索・フォーム操作はできますが、実店舗/予約サイト固有Adapter、確認メールの
-自動照合、実カード、銀行Adapter、実送金はありません。MoneyはSandboxだけです。
+- Browser locator retry、DOM安定化、stale ref/page change検出、popup/multi-tab
+- login signal、upload count、download hash/completion、submit postcondition、confirmation ID抽出
+- read-only `SiteAdapter` interfaceとlocal fixture用reservation example
+- Shopping/Reservationのcandidate、selection、exact quote、submission、email/receipt reconciliation
+- Browser evidenceと第二のdurable evidenceが一致しない場合の`SUBMITTED_UNKNOWN`維持
+- Todo/Calendar/Communication/Refund/Reservationを直接読むevent-driven Proactive rule
+- quiet hours、category opt-in、dedup、follow-up上限を持つAttention manager
+- FTS + optional local Embedding + Recency + Importance + Confidence + EntityのHybrid Memory
+- `supersedes` relation、source evidence、timestamp、expiry。矛盾情報を破壊的上書きしない
 
-## Phase 8: Proactive・学習・分析（基盤を実装）
+### Operations / supply chain
 
-- 既定OFF、カテゴリ別OFF、quiet hours、最低通知間隔を持つAttention Manager
-- 返信、返金、配送、期限、subscriptionの根拠付き検出・重複排除・最大30日follow-up
-- Preference候補はEvidenceとconfidenceを要求し、人が承認するまでMemoryへ反映しない
-- 成功Tool sequenceのWorkflow候補化。承認後も `accepted_disabled` で自動実行しない
-- DB integrity/quota/disk/process/GPU、Task/Action/Model latency、失敗分類
-- 秘密を含まないJSON export、exact confirmation付き範囲削除、暗号化backup/restore
-- 17カテゴリ、1〜3 trial、weighted score、skip/errorを区別するdry-run Benchmark
+- schema version、暗号化backup/restore、復号+SQLite integrity verify、自動backup、件数/日数retention
+- task/tool成功率、latency、model token/latency、browser failure、approval/auth wait、
+  submitted_unknown、recovery、scheduler delay、通知成功率、provider sync error metrics
+- `personal-agent doctor`によるCore/Model/DB/Browser/Secret/LINE/Google/Tailscale/Passkey/HA/Voice診断
+- exact dependency lock、Dependabot、最小GitHub Actions permission
+- CIのpip-audit、Bandit、detect-secrets、Python 3.11/3.12、Local E2E
 
-Liquid AI/Gemma等の第二model、選択的embedding、複数部屋Voice Satelliteは未実装です。
+## Unit test済み
 
-## Files・Computer・Home・PWA（実装済みの範囲）
+- Approval material改変、single-use、R4/R5 strong-auth境界
+- durable mutation crash/restart、idempotency、submitted_unknown replay抑止
+- Todo scheduler/recurrence、Calendar conflict、Gmail OAuth/refresh/attachment quarantine
+- Contacts ambiguity、各file parser、Vision順序、Computer/Coding allowlist
+- Commerce quote/reconciliation/no-resend、Hybrid Memory/supersedes、Proactive event rule
+- Browser SSRF、private subresource、finance allowlist、secret field、takeover、real Chromium DOM操作
+- LINE署名/primary user、Tailscale header spoofing、WebAuthn binding、secret redaction
+- backup round-trip/verify/prune、doctor DB check、observability
 
-- allowlist root、symlink escape防止、Secret/key除外、no-overwrite、回収可能Trash
-- Text/JSON/Markdown/CSV/YAMLのbounded read。PDF/OCR/画像抽出・分類は未実装
-- OS status、永続local notification、Windows workstation lock。任意shell/app起動は非公開
-- private network限定Home Assistant、低リスクdomain、bounded temperature、safe-scene allowlist
-- PWAのChat/Task/Memory/Safety/Ops、Connector/Budget/Payee/Audit/Metrics/Benchmark/Data control
+## Integration test済み
 
-## 運用前に必要なもの
+- TestClient経由のTodo作成→期限到来→PWA notification claim/ack→complete
+- Diary create/search、Memory create/search、local Calendar create/list
+- Browser Worker APIのauth/idempotency、Privileged Gmail/Slack/Google refresh mock
+- Playwright Chromiumのsnapshot/type/secret guard/submit verification/masked screenshot
+- local browser fixtureにform/login/popup/download/upload/confirmation/CAPTCHA/prompt-injection case
+- Core restart相当のExecutionStore再生成とmutation不明状態復旧
 
-- Windows 11のBitLocker/Device Encryptionと同梱preflightによるACL設定
-- Wake Word/STT/TTS model、Chrome/Playwright
-- 利用するLINE/Slack/Gmail/Home Assistant credentialとprovider側scope
-  （LINEの署名付きWebhook専用Funnel経路と自動Push workerは構築済み、credential投入待ち）
-- 本人の端末だけに絞ったTailscale Grant/ACL
-- iPhone Face ID passkeyに加え、Windows HelloまたはFIDO2 security keyのbackup passkey
-- 実機・実credentialを使ったend-to-end検証と、対象site/provider固有の回帰試験
+## 実機検証済み
 
-このCyborgでは指定GGUFのSHA-256検証、CUDA llama.cpp起動、`ncmoe40`、32K context、API key、
-Tailnet限定HTTPS、送信元/identity検証、未ログイン遠隔APIの401遮断、初回登録endpoint、通常応答、
-実Tool loopまで確認済みです。実Tool loopの生成速度は約27〜28 token/秒でした。
-iPhone Face ID passkeyの登録・sign-inも実機で完了しています。Grant/ACLの管理画面反映、backup passkey、
-外部provider credentialの投入は利用者作業です。
+- `unsloth/Qwen3.6-35B-A3B-GGUF` / `UD-Q4_K_XL`、llama.cpp、`--n-cpu-moe 40`
+- Tailnet限定HTTPS、Tailscale identity検証、未login遠隔API遮断
+- iPhone Safari/PWAからのFace ID passkey登録・sign-in
+- local Qwen通常応答とtool-call loop（以前の環境で約25〜28 token/秒）
 
-## 現在の分類
+## Credential待ち
 
-### 実装済み
+- 本人Gmail/Google CalendarでのOAuth・refresh・同期・送信E2E
+- LINE Messaging API再構築時の本人channel credentialとpush/webhook再確認
+- Slack/Home Assistantの本人credential E2E
+- 実通販/ホテルサイトでの購入・予約。対象siteごとのAdapter/回帰fixture追加が必要
 
-- Qwen Chat Completions client、thinking切替、Tool call JSON、usage/latency、timeout/HTTP/empty応答処理
-- step-scoped Capability PlanとTool Broker permission enforcement
-- PersonalTodoのcreate/list/complete/update、Diaryのcreate/read/search、深夜business date
-- endpoint security class、署名付きLINE webhook、worker token、遠隔identity + passkey境界
-- Activity ORIGIN_ONLY最小化、idempotency、submitted_unknown、approval、secret非露出のunit regression
-- Python 3.11/3.12 GitHub Actions定義
+## 部分実装
 
-### 部分実装
+- Google ContactsはOAuth scopeと統合store/sourceを持つが、People API取得・同期は未実装
+- VisionはOpenAI互換local image endpointを設定した場合だけ有効。専用OCR modelは同梱しない
+- SiteAdapterはframework + example。大量サイトAdapterは未実装
+- Proactive ruleは決定論的な代表例。全provider/全subscription形式を網羅しない
+- iOS background Web Pushは未実装。確実なbackground通知はLINE fan-outを使用
 
-- Capability Plannerは信頼済みユーザー依頼だけから作る決定論的な初期版です。汎用model plannerや
-  任意workflow生成は行わず、認識できない依頼はTool権限をgrantしません。
-- Todo/DiaryはCore store・Tool・export/deleteまで実装済みですが、専用PWA一覧画面はありません。
+## 未実装（意図的scope外を含む）
 
-### 未実装
+- Alexa、複数部屋Alexa
+- Google People APIからのContacts取得・同期
+- 実銀行送金、実カード専用Adapter
+- unrestricted root shell、任意sudo、credential dump
+- Agent自身によるPolicy変更、Finance Lock解除、credential/trusted payee登録
+- 任意のiPhone app操作やLINE暗号化DBの直接読取
 
-- 第二model/router、実銀行・実カード決済、任意shell、無制限desktop automation、Alexa、複数Voice Satellite
-- 大量のsite固有Shopping/Reservation adapter
+## 実運用前の必須確認
 
-### 実機検証待ち
+1. `personal-agent doctor`で設定済みcomponentがすべて`OK`になること。
+2. `ruff check .`、`pytest`、`pytest -m e2e`、`python -m compileall -q src`を再実行すること。
+3. Tailscale Grant/ACLを本人identityとPersonal Agent portだけに絞ること。
+4. iPhone以外のbackup passkeyを登録すること。
+5. Windows BitLocker/Device Encryption、Worker profile/Secret DB ACL、backup restore手順を確認すること。
+6. 実provider/実siteは少額またはcancel可能なsandbox条件で個別E2Eを行うこと。
 
-- 新しい直接Tailscale bind用peer identity mapping（推奨構成は引き続きloopback proxy）
-- GitHub上でのPython 3.11/3.12 CI実行。ローカルPython 3.12ではRuff/全pytest/compileallを実行済み
+## DPAPI backupの注意
 
-### provider credential待ち
+Secret Workerの暗号文は同じWindows user profileへbindingされます。DBファイルのbackupだけでは別PC・
+別Windows userへ復元できません。Windows回復手段と、Google/LINE/Slack等のcredential再発行手順を
+オフラインで保管してください。Core backupの自動verifyはSQLite破損を検出しますが、DPAPI portabilityを
+保証するものではありません。
 
-- Slack/Gmail/Home Assistantの実service E2E、Google Calendar provider同期
-- LINE Messaging API/LINE Desktopは実装済み境界を維持するが、再構築時は本人credentialと実機確認が必要
+## Alexa readiness
+
+将来Alexaを追加する場合はAlexa Skillから直接Toolを呼ばず、既存Voice GatewayのSTT済みtext contractへ
+入力し、同じTask/Capability/Policy/Approval/Verification経路を通します。Alexa account linkingも新しい
+trusted identity adapterとして追加し、既存passkeyやSafety Lockを迂回させません。

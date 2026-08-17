@@ -192,9 +192,7 @@ def test_pwa_exposes_passkey_status_and_security_headers(client: TestClient) -> 
     assert "Face IDでサインイン" in pwa
 
 
-def test_remote_api_requires_allowed_tailscale_identity_and_passkey(
-    monkeypatch, tmp_path
-) -> None:
+def test_remote_api_requires_allowed_tailscale_identity_and_passkey(monkeypatch, tmp_path) -> None:
     class Model:
         async def complete(self, _messages) -> str:
             return "local model response"
@@ -225,9 +223,7 @@ def test_remote_api_requires_allowed_tailscale_identity_and_passkey(
         assert blocked.status_code == 401
         assert "passkey" in blocked.json()["detail"]
         with pytest.raises(WebSocketDisconnect):
-            with remote.websocket_connect(
-                "/api/channels/voice/ws", headers=owner_header
-            ):
+            with remote.websocket_connect("/api/channels/voice/ws", headers=owner_header):
                 pass
 
         service = app.state.runtime.strong_auth

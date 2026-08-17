@@ -164,6 +164,12 @@ class ObservabilityService:
 
     def metrics(self) -> dict[str, Any]:
         with self.storage.read_connection() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
             tasks = connection.execute(
                 "SELECT state, route, created_at, updated_at, error, result_json FROM tasks"
             ).fetchall()
@@ -176,6 +182,36 @@ class ObservabilityService:
             approval_rows = connection.execute(
                 "SELECT state, COUNT(*) AS count FROM approvals GROUP BY state"
             ).fetchall()
+            approval_wait_rows = connection.execute(
+                "SELECT created_at, decided_at FROM approvals WHERE decided_at IS NOT NULL"
+            ).fetchall()
+            auth_wait_rows = (
+                connection.execute(
+                    "SELECT started_at, updated_at FROM execution_steps "
+                    "WHERE status='WAITING_AUTH' AND started_at IS NOT NULL"
+                ).fetchall()
+                if "execution_steps" in tables
+                else []
+            )
+            scheduler_rows = connection.execute(
+                "SELECT jobs.run_at, notifications.created_at FROM scheduled_jobs jobs "
+                "JOIN notifications USING(job_id)"
+            ).fetchall()
+            delivery_rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM notification_deliveries GROUP BY status"
+            ).fetchall()
+            provider_rows = (
+                connection.execute(
+                    "SELECT provider, status, last_error FROM calendar_provider_state"
+                ).fetchall()
+                if "calendar_provider_state" in tables
+                else []
+            )
+            recovery_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM task_events WHERE event_type='recovered_after_restart'"
+                ).fetchone()[0]
+            )
 
         task_states = Counter(row["state"] for row in tasks)
         routes = Counter(row["route"] or "unrouted" for row in tasks)
@@ -213,22 +249,65 @@ class ObservabilityService:
             if isinstance(details.get("duration_ms"), (int, float)):
                 tool_recorded_durations.append(float(details["duration_ms"]))
         completion_tokens = sum(int(item.get("completion_tokens") or 0) for item in model_turns)
+        prompt_tokens = sum(int(item.get("prompt_tokens") or 0) for item in model_turns)
         model_duration_ms = sum(float(item.get("duration_ms") or 0) for item in model_turns)
+        terminal_tasks = sum(
+            task_states.get(state, 0)
+            for state in ("COMPLETED", "FAILED", "CANCELLED", "SUBMITTED_UNKNOWN")
+        )
+        completed_tasks = task_states.get("COMPLETED", 0)
+        terminal_tools = sum(tool_status.values()) - tool_status.get("started", 0)
+        successful_tools = tool_status.get("ok", 0) + tool_status.get("duplicate", 0)
+        approval_waits = [
+            self._duration_ms(row["created_at"], row["decided_at"]) for row in approval_wait_rows
+        ]
+        auth_waits = [
+            self._duration_ms(row["started_at"], row["updated_at"]) for row in auth_wait_rows
+        ]
+        scheduler_delays = [
+            max(0.0, self._duration_ms(row["run_at"], row["created_at"])) for row in scheduler_rows
+        ]
+        delivery_status = {row["status"]: row["count"] for row in delivery_rows}
+        delivery_terminal = sum(
+            delivery_status.get(status, 0) for status in ("delivered", "failed", "unknown")
+        )
+        browser_failure_categories: Counter[str] = Counter()
+        for row in audits:
+            if not str(row["action"]).startswith("browser.") or row["result"] in {
+                "ok",
+                "duplicate",
+                "dry_run",
+            }:
+                continue
+            try:
+                details = json.loads(row["details_json"])
+            except json.JSONDecodeError:
+                details = {}
+            browser_failure_categories[
+                str(details.get("reason_code") or row["result"] or "unknown")
+            ] += 1
         return {
             "tasks": {
                 "total": len(tasks),
                 "by_state": dict(task_states),
                 "by_route": dict(routes),
                 "duration_ms": self._distribution(task_durations),
+                "success_rate": (
+                    round(completed_tasks / terminal_tasks, 4) if terminal_tasks else None
+                ),
             },
             "tools": {
                 "total": len(actions),
                 "by_name": dict(tool_calls),
                 "by_status": dict(tool_status),
                 "duration_ms": self._distribution(tool_recorded_durations or action_durations),
+                "success_rate": (
+                    round(successful_tools / terminal_tools, 4) if terminal_tools else None
+                ),
             },
             "model": {
                 "turns": len(model_turns),
+                "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "duration_ms": round(model_duration_ms, 2),
                 "tokens_per_second": (
@@ -242,8 +321,35 @@ class ObservabilityService:
                 "policy_denials": policy_denials,
                 "human_takeovers": takeover_count,
                 "approvals": {row["state"]: row["count"] for row in approval_rows},
+                "approval_wait_ms": self._distribution(approval_waits),
+                "auth_wait_ms": self._distribution(auth_waits),
+                "submitted_unknown_count": (
+                    task_states.get("SUBMITTED_UNKNOWN", 0)
+                    + tool_status.get("submitted_unknown", 0)
+                ),
             },
             "failures": dict(failure_classes),
+            "browser": {"failure_categories": dict(browser_failure_categories)},
+            "recovery": {"count": recovery_count},
+            "scheduler": {"delay_ms": self._distribution(scheduler_delays)},
+            "notifications": {
+                "by_status": delivery_status,
+                "delivery_success_rate": (
+                    round(delivery_status.get("delivered", 0) / delivery_terminal, 4)
+                    if delivery_terminal
+                    else None
+                ),
+            },
+            "provider_sync": {
+                "errors": [
+                    {"provider": row["provider"], "status": row["status"]}
+                    for row in provider_rows
+                    if row["status"] != "ok" or row["last_error"]
+                ],
+                "error_count": sum(
+                    1 for row in provider_rows if row["status"] != "ok" or row["last_error"]
+                ),
+            },
         }
 
     def queue_quota_warning(self, *, user_id: str) -> str | None:

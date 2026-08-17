@@ -98,16 +98,12 @@ class BrowserWorkerSettings:
             finance_allowlist=tuple(str(item) for item in data.get("finance_allowlist", [])),
             takeover_timeout_seconds=int(data.get("takeover_timeout_seconds", 300)),
             navigation_timeout_ms=int(data.get("navigation_timeout_ms", 30_000)),
-            core_base_url=str(data.get("core_base_url", "http://127.0.0.1:8789")).rstrip(
-                "/"
-            ),
+            core_base_url=str(data.get("core_base_url", "http://127.0.0.1:8789")).rstrip("/"),
             secret_db_path=Path(data["secret_db_path"]),
             upload_roots=tuple(Path(item) for item in data.get("upload_roots", [])),
             allow_private_navigation=bool(data.get("allow_private_navigation", False)),
             allow_non_windows=bool(data.get("allow_non_windows", False)),
-            allowed_client_cidrs=tuple(
-                str(item) for item in data.get("allowed_client_cidrs", [])
-            ),
+            allowed_client_cidrs=tuple(str(item) for item in data.get("allowed_client_cidrs", [])),
         )
 
     def validate_bind_host(self) -> None:

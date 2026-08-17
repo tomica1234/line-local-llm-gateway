@@ -122,9 +122,9 @@ class WindowsLineDesktopBackend:
         candidates = non_minimized or matches
         return max(
             candidates,
-            key=lambda handle: (
-                lambda rect: max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1])
-            )(win32gui.GetWindowRect(handle)),
+            key=lambda handle: (lambda rect: max(0, rect[2] - rect[0]) * max(0, rect[3] - rect[1]))(
+                win32gui.GetWindowRect(handle)
+            ),
         )
 
     @staticmethod
@@ -324,9 +324,7 @@ class WindowsLineDesktopBackend:
             if not title:
                 continue
             time_tokens = [
-                token
-                for token in lines[0]
-                if token.center_x >= row[0] + row_width * 0.70
+                token for token in lines[0] if token.center_x >= row[0] + row_width * 0.70
             ]
             time_label = self._line_text(time_tokens)
             preview = _normalized(" ".join(self._line_text(line) for line in lines[1:]))
@@ -336,9 +334,7 @@ class WindowsLineDesktopBackend:
             self.store.remember_conversation(conversation_id, title)
             messages.append(
                 VisibleMessage(
-                    message_id=_message_id(
-                        conversation_id, "chat_preview", preview, time_label
-                    ),
+                    message_id=_message_id(conversation_id, "chat_preview", preview, time_label),
                     conversation_id=conversation_id,
                     conversation_title=title,
                     timestamp=captured_at,
@@ -619,9 +615,12 @@ class WindowsLineDesktopBackend:
         finally:
             await asyncio.to_thread(self._restore_minimized, initial_capture)
 
-        external_message_id = "lds-" + hashlib.sha256(
-            f"{request.conversation_id}\0{request.idempotency_key}".encode()
-        ).hexdigest()
+        external_message_id = (
+            "lds-"
+            + hashlib.sha256(
+                f"{request.conversation_id}\0{request.idempotency_key}".encode()
+            ).hexdigest()
+        )
         self.store.finish_send(
             request.idempotency_key,
             status="ok",

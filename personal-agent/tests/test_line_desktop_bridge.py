@@ -66,9 +66,7 @@ def test_bridge_requires_token_and_never_returns_screenshot(tmp_path: Path) -> N
     app = create_line_desktop_bridge_app(bridge_settings(tmp_path), FakeBackend())
     with TestClient(app) as client:
         assert client.post("/v1/snapshot").status_code == 401
-        response = client.post(
-            "/v1/snapshot", headers={"X-Line-Desktop-Token": "b" * 48}, json={}
-        )
+        response = client.post("/v1/snapshot", headers={"X-Line-Desktop-Token": "b" * 48}, json={})
     assert response.status_code == 200
     assert response.json()["screenshot_persisted"] is False
     assert response.json()["messages"][0]["text"] == "明日の予定を確認"
@@ -223,9 +221,7 @@ async def test_core_client_normalizes_bridge_snapshot() -> None:
 
 
 async def test_core_sync_ingests_desktop_messages_as_untrusted(tmp_path: Path) -> None:
-    app = create_app(
-        Settings(db_path=tmp_path / "core.sqlite3", admin_token="a" * 32), FakeModel()
-    )
+    app = create_app(Settings(db_path=tmp_path / "core.sqlite3", admin_token="a" * 32), FakeModel())
 
     class FakeClient:
         async def sync_visible(self) -> list[Any]:

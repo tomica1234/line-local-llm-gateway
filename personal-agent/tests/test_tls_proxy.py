@@ -17,9 +17,10 @@ def load_proxy_module():
 
 def test_parse_proxy_v1_tcp4_source() -> None:
     proxy = load_proxy_module()
-    assert proxy.parse_proxy_v1_line(
-        b"PROXY TCP4 100.64.0.10 100.64.0.11 54321 9443\r\n"
-    ) == ("100.64.0.10", 54321)
+    assert proxy.parse_proxy_v1_line(b"PROXY TCP4 100.64.0.10 100.64.0.11 54321 9443\r\n") == (
+        "100.64.0.10",
+        54321,
+    )
 
 
 @pytest.mark.parametrize(
@@ -39,9 +40,7 @@ def test_parse_proxy_v1_rejects_malformed_input(line: bytes) -> None:
 
 
 def test_proxy_source_strips_client_supplied_identity_and_forwarding_headers() -> None:
-    source = (
-        Path(__file__).parents[1] / "scripts" / "windows-tls-proxy.py"
-    ).read_text()
+    source = (Path(__file__).parents[1] / "scripts" / "windows-tls-proxy.py").read_text()
     for protected_header in (
         '"tailscale-user-login"',
         '"x-forwarded-for"',

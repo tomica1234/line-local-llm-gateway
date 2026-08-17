@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -70,6 +71,23 @@ _PATTERNS: list[tuple[str, re.Pattern[str], Attention, float]] = [
         0.82,
     ),
 ]
+_EVENT_CATEGORIES = {
+    "todo_due",
+    "calendar_travel",
+    "communication_follow_up",
+    "refund_overdue",
+    "reservation_calendar",
+    "subscription",
+}
+
+
+@dataclass(frozen=True, slots=True)
+class ProactiveEvent:
+    category: str
+    summary: str
+    attention: Attention
+    confidence: float
+    evidence_id: str
 
 
 class ProactiveService:
@@ -83,7 +101,9 @@ class ProactiveService:
             connection.executescript(PROACTIVE_SCHEMA)
         defaults = {
             "proactive_enabled": False,
-            "proactive_categories": {item[0]: True for item in _PATTERNS},
+            "proactive_categories": {
+                name: True for name in ({item[0] for item in _PATTERNS} | _EVENT_CATEGORIES)
+            },
             "proactive_quiet_hours": {"start": "22:00", "end": "07:00"},
             "proactive_frequency_minutes": 300,
         }
@@ -109,7 +129,7 @@ class ProactiveService:
         quiet_hours: dict[str, str],
         frequency_minutes: int = 300,
     ) -> dict[str, Any]:
-        known = {item[0] for item in _PATTERNS}
+        known = {item[0] for item in _PATTERNS} | _EVENT_CATEGORIES
         if not set(categories).issubset(known):
             raise ValueError("Unknown proactive category")
         for key in ("start", "end"):
@@ -161,7 +181,166 @@ class ProactiveService:
                     created.append(opportunity)
                     if selected_attention in {Attention.NOTIFY_NOW, Attention.ACTION_REQUIRED}:
                         opportunity["notified_task_id"] = self._notify(opportunity)
+        for event in self._source_events():
+            if not settings["categories"].get(event.category, True):
+                continue
+            attention = (
+                Attention.DAILY_DIGEST
+                if quiet and event.attention in {Attention.NOTIFY_NOW, Attention.ACTION_REQUIRED}
+                else event.attention
+            )
+            opportunity = self._insert(
+                category=event.category,
+                summary=event.summary,
+                attention=attention,
+                confidence=event.confidence,
+                evidence_event_id=event.evidence_id,
+            )
+            if opportunity:
+                created.append(opportunity)
+                if attention in {Attention.NOTIFY_NOW, Attention.ACTION_REQUIRED}:
+                    opportunity["notified_task_id"] = self._notify(opportunity)
         return created
+
+    def _source_events(self) -> list[ProactiveEvent]:
+        """Deterministic event-source rules; external text cannot add capabilities."""
+        now = datetime.now(UTC)
+        horizon = now + timedelta(hours=24)
+        events: list[ProactiveEvent] = []
+        with self.storage.read_connection() as connection:
+            tables = {
+                row["name"]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
+            todos = (
+                connection.execute(
+                    "SELECT todo_id, title, due_at FROM personal_todos "
+                    "WHERE user_id=? AND status='open' AND due_at IS NOT NULL AND due_at<=?",
+                    (self.user_id, horizon.isoformat()),
+                ).fetchall()
+                if "personal_todos" in tables
+                else []
+            )
+            calendar = (
+                connection.execute(
+                    "SELECT event_id, title, start_at, end_at, location FROM calendar_events "
+                    "WHERE status!='cancelled' AND start_at>=? AND start_at<=? ORDER BY start_at",
+                    (now.isoformat(), (now + timedelta(days=7)).isoformat()),
+                ).fetchall()
+                if "calendar_events" in tables
+                else []
+            )
+            messages = (
+                connection.execute(
+                    "SELECT source, message_id, text, labels_json, timestamp "
+                    "FROM communication_messages ORDER BY timestamp DESC LIMIT 200"
+                ).fetchall()
+                if "communication_messages" in tables
+                else []
+            )
+            refunds = (
+                connection.execute(
+                    "SELECT economic_intent_id, target, conditions_json FROM economic_intents "
+                    "WHERE action_type='refund' "
+                    "AND execution_state NOT IN ('CONFIRMED','CANCELLED')"
+                ).fetchall()
+                if "economic_intents" in tables
+                else []
+            )
+        for todo in todos:
+            try:
+                due = datetime.fromisoformat(todo["due_at"])
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=self.timezone)
+                overdue = due.astimezone(UTC) < now
+            except ValueError:
+                continue
+            events.append(
+                ProactiveEvent(
+                    category="todo_due",
+                    summary=("期限超過" if overdue else "24時間以内") + f": {todo['title']}",
+                    attention=Attention.ACTION_REQUIRED if overdue else Attention.NOTIFY_NOW,
+                    confidence=1.0,
+                    evidence_id=f"todo:{todo['todo_id']}:{todo['due_at']}",
+                )
+            )
+        for previous, following in zip(calendar, calendar[1:], strict=False):
+            if not previous["location"] or not following["location"]:
+                continue
+            if previous["location"].casefold() == following["location"].casefold():
+                continue
+            try:
+                gap = (
+                    datetime.fromisoformat(following["start_at"])
+                    - datetime.fromisoformat(previous["end_at"])
+                ).total_seconds()
+            except (TypeError, ValueError):
+                continue
+            if 0 <= gap < 30 * 60:
+                events.append(
+                    ProactiveEvent(
+                        category="calendar_travel",
+                        summary=(
+                            f"移動時間が{int(gap // 60)}分です: "
+                            f"{previous['title']} → {following['title']}"
+                        ),
+                        attention=Attention.MENTION_LATER,
+                        confidence=0.9,
+                        evidence_id=(f"calendar:{previous['event_id']}:{following['event_id']}"),
+                    )
+                )
+        calendar_text = "\n".join(str(row["title"]) for row in calendar).casefold()
+        for message in messages:
+            labels = {str(item).casefold() for item in json.loads(message["labels_json"])}
+            text = str(message["text"])
+            if labels & {"reply_required", "needs_reply", "要返信"}:
+                events.append(
+                    ProactiveEvent(
+                        category="communication_follow_up",
+                        summary=f"返信確認: {text[:300]}",
+                        attention=Attention.ACTION_REQUIRED,
+                        confidence=0.95,
+                        evidence_id=f"message:{message['source']}:{message['message_id']}",
+                    )
+                )
+            if re.search(r"(?i)hotel|booking|reservation|ホテル|宿泊|予約確認", text):
+                tokens = [token for token in re.split(r"\s+", text.casefold()) if len(token) >= 4]
+                if not any(token in calendar_text for token in tokens[:20]):
+                    events.append(
+                        ProactiveEvent(
+                            category="reservation_calendar",
+                            summary=f"予約メールを予定に追加する候補: {text[:300]}",
+                            attention=Attention.MENTION_LATER,
+                            confidence=0.78,
+                            evidence_id=f"reservation-message:{message['source']}:{message['message_id']}",
+                        )
+                    )
+        for refund in refunds:
+            conditions = json.loads(refund["conditions_json"])
+            expected = conditions.get("expected_refund_at")
+            if not expected:
+                continue
+            try:
+                expected_at = datetime.fromisoformat(str(expected))
+                if expected_at.tzinfo is None:
+                    expected_at = expected_at.replace(tzinfo=UTC)
+            except ValueError:
+                continue
+            if expected_at.astimezone(UTC) < now:
+                events.append(
+                    ProactiveEvent(
+                        category="refund_overdue",
+                        summary=f"返金予定日を超過: {refund['target']}",
+                        attention=Attention.ACTION_REQUIRED,
+                        confidence=1.0,
+                        evidence_id=(
+                            f"refund:{refund['economic_intent_id']}:{expected_at.isoformat()}"
+                        ),
+                    )
+                )
+        return events
 
     def list(self, *, state: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
         with self.storage.read_connection() as connection:

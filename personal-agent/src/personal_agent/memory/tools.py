@@ -15,6 +15,7 @@ class MemoryRememberArgs(BaseModel):
     kind: MemoryKind = MemoryKind.FACT
     confidence: float = Field(default=1.0, ge=0, le=1)
     evidence_event_ids: list[str] = Field(default_factory=list, max_length=100)
+    supersedes_memory_id: str | None = Field(default=None, max_length=128)
 
 
 class MemoryForgetArgs(BaseModel):
@@ -36,6 +37,7 @@ def memory_tools(memory: MemoryStore, *, user_id: str) -> list[ToolDefinition[An
                 kind=parsed.kind,
                 confidence=parsed.confidence,
                 evidence_event_ids=parsed.evidence_event_ids,
+                supersedes_memory_id=parsed.supersedes_memory_id,
             ),
         )
         return ToolResult(

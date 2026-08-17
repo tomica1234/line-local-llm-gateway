@@ -116,6 +116,8 @@ class WorkerCommunicationAdapter:
         provider: str,
         credential_id: str,
         worker: BrowserWorkerClient,
+        oauth_client_id_credential_id: str | None = None,
+        oauth_client_secret_credential_id: str | None = None,
     ) -> None:
         if source not in {CommunicationSource.SLACK, CommunicationSource.EMAIL}:
             raise ValueError("Worker connector only supports Slack and email")
@@ -123,6 +125,8 @@ class WorkerCommunicationAdapter:
         self.provider = provider
         self.credential_id = credential_id
         self.worker = worker
+        self.oauth_client_id_credential_id = oauth_client_id_credential_id
+        self.oauth_client_secret_credential_id = oauth_client_secret_credential_id
 
     async def send(
         self,
@@ -152,6 +156,8 @@ class WorkerCommunicationAdapter:
                 reason="Approved communication draft send",
                 risk_level=RiskLevel.R2,
             ),
+            oauth_client_id_credential_id=self.oauth_client_id_credential_id,
+            oauth_client_secret_credential_id=self.oauth_client_secret_credential_id,
         )
 
     async def search(
@@ -163,6 +169,8 @@ class WorkerCommunicationAdapter:
             task_id=task_id,
             query=query,
             limit=limit,
+            oauth_client_id_credential_id=self.oauth_client_id_credential_id,
+            oauth_client_secret_credential_id=self.oauth_client_secret_credential_id,
         )
         return [NormalizedMessageCreate.model_validate(item) for item in result.get("messages", [])]
 
@@ -224,6 +232,7 @@ class CommunicationService:
             text=draft.text,
             thread_id=draft.thread_id,
             reply_to=draft.reply_to,
+            attachments=[item.model_dump(mode="json") for item in draft.attachments],
         )
 
     async def send(

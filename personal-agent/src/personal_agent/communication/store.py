@@ -5,6 +5,7 @@ import uuid
 from typing import Any
 
 from ..memory.sanitizer import sanitize_payload, sanitize_text
+from ..migrations import Migration, add_column, apply_migrations
 from ..storage import Storage, utc_now
 from .models import (
     CommunicationSearchHit,
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS communication_messages (
     attachments_json TEXT NOT NULL,
     reply_to TEXT,
     permissions_json TEXT NOT NULL,
+    labels_json TEXT NOT NULL DEFAULT '[]',
     source_reference TEXT NOT NULL,
     created_at TEXT NOT NULL,
     PRIMARY KEY(source, message_id)
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS communication_drafts (
     text TEXT NOT NULL,
     thread_id TEXT,
     reply_to TEXT,
+    attachments_json TEXT NOT NULL DEFAULT '[]',
     state TEXT NOT NULL,
     external_message_id TEXT,
     evidence_json TEXT NOT NULL,
@@ -58,6 +61,20 @@ CREATE TABLE IF NOT EXISTS connectors (
     updated_at TEXT NOT NULL
 );
 """
+
+
+def _communication_v2(connection: Any) -> None:
+    add_column(connection, "communication_drafts", "attachments_json TEXT NOT NULL DEFAULT '[]'")
+
+
+def _communication_v3(connection: Any) -> None:
+    add_column(connection, "communication_messages", "labels_json TEXT NOT NULL DEFAULT '[]'")
+
+
+COMMUNICATION_MIGRATIONS = (
+    Migration(2, "draft-attachment-approval-metadata", _communication_v2),
+    Migration(3, "provider-message-labels", _communication_v3),
+)
 
 
 class CommunicationStore:
@@ -75,6 +92,11 @@ class CommunicationStore:
                 connection.execute(
                     "ALTER TABLE communication_drafts ADD COLUMN subject TEXT NOT NULL DEFAULT ''"
                 )
+            apply_migrations(
+                connection,
+                component="communication",
+                migrations=COMMUNICATION_MIGRATIONS,
+            )
 
     def ingest(self, message: NormalizedMessageCreate) -> bool:
         text, _ = sanitize_text(message.text)
@@ -86,8 +108,9 @@ class CommunicationStore:
             cursor = connection.execute(
                 "INSERT OR IGNORE INTO communication_messages "
                 "(message_id, source, conversation_id, thread_id, sender_entity_id, "
-                "timestamp, text, attachments_json, reply_to, permissions_json, "
-                "source_reference, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "timestamp, text, attachments_json, reply_to, permissions_json, labels_json, "
+                "source_reference, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     message.message_id,
                     message.source.value,
@@ -99,6 +122,7 @@ class CommunicationStore:
                     json.dumps(attachments, ensure_ascii=False),
                     message.reply_to,
                     json.dumps(message.permissions),
+                    json.dumps(message.labels, ensure_ascii=False),
                     message.source_reference,
                     utc_now(),
                 ),
@@ -122,6 +146,15 @@ class CommunicationStore:
                 "ON f.message_key = m.source || ':' || m.message_id "
                 "WHERE communication_fts MATCH ? ORDER BY bm25(communication_fts) LIMIT ?",
                 (match, limit),
+            ).fetchall()
+        return [self._message(row) for row in rows]
+
+    def recent(self, *, limit: int = 50) -> list[CommunicationSearchHit]:
+        with self.storage.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM communication_messages "
+                "ORDER BY timestamp DESC, created_at DESC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [self._message(row) for row in rows]
 
@@ -170,6 +203,7 @@ class CommunicationStore:
         text: str,
         thread_id: str | None,
         reply_to: str | None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> DraftRecord:
         safe_subject, _ = sanitize_text(subject)
         safe_text, _ = sanitize_text(text)
@@ -179,8 +213,9 @@ class CommunicationStore:
             connection.execute(
                 "INSERT INTO communication_drafts "
                 "(draft_id, task_id, source, recipient_entity_id, conversation_id, subject, "
-                "text, thread_id, reply_to, state, evidence_json, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '{}', ?, ?)",
+                "text, thread_id, reply_to, attachments_json, state, evidence_json, "
+                "created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft', '{}', ?, ?)",
                 (
                     draft_id,
                     task_id,
@@ -191,6 +226,7 @@ class CommunicationStore:
                     safe_text,
                     thread_id,
                     reply_to,
+                    json.dumps(attachments or [], ensure_ascii=False),
                     now,
                     now,
                 ),
@@ -286,7 +322,10 @@ class CommunicationStore:
             sender_entity_id=row["sender_entity_id"],
             timestamp=row["timestamp"],
             text=row["text"],
+            attachments=json.loads(row["attachments_json"]),
+            permissions=json.loads(row["permissions_json"]),
             source_reference=row["source_reference"],
+            labels=json.loads(row["labels_json"]),
         )
 
     @staticmethod
@@ -301,6 +340,7 @@ class CommunicationStore:
             text=row["text"],
             thread_id=row["thread_id"],
             reply_to=row["reply_to"],
+            attachments=json.loads(row["attachments_json"]),
             state=row["state"],
             external_message_id=row["external_message_id"],
             evidence=json.loads(row["evidence_json"]),

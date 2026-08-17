@@ -13,6 +13,8 @@ from personal_agent.browser_worker.connectors import (
     ConnectorSearchRequest,
     ConnectorSendRequest,
     ConnectorWorkerService,
+    GoogleCredentialCheckRequest,
+    GoogleCredentialRefs,
 )
 from personal_agent.browser_worker.models import ActionContext
 from personal_agent.browser_worker.store import BrowserWorkerStore
@@ -257,3 +259,44 @@ async def test_connector_rejects_display_names_and_marks_network_unknown(
     assert replay["status"] == "submitted_unknown"
     assert replay["replay_suppressed"] is True
     assert replay["resent"] is False
+
+
+@pytest.mark.asyncio
+async def test_google_status_refreshes_without_exposing_tokens(tmp_path: Path) -> None:
+    origin = "https://oauth2.googleapis.com"
+    refs = GoogleCredentialRefs(
+        refresh_credential_id="secret://google/refresh",
+        client_id_credential_id="secret://google/client-id",
+        client_secret_credential_id="secret://google/client-secret",
+    )
+    secrets = _secret(
+        tmp_path, credential_id=refs.refresh_credential_id, origin=origin, value="refresh-private"
+    )
+    _secret(tmp_path, credential_id=refs.client_id_credential_id, origin=origin, value="client-id")
+    secrets = _secret(
+        tmp_path,
+        credential_id=refs.client_secret_credential_id,
+        origin=origin,
+        value="client-secret-private",
+    )
+    worker_store = BrowserWorkerStore(tmp_path / "worker.sqlite3")
+    worker_store.initialize()
+    service = ConnectorWorkerService(
+        secrets,
+        worker_store,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json={"access_token": "access-private"})
+        ),
+    )
+
+    result = await service.google_status(
+        GoogleCredentialCheckRequest(credentials=refs, task_id="doctor-check")
+    )
+
+    assert result == {
+        "status": "ok",
+        "refresh_succeeded": True,
+        "access_token_exposed": False,
+        "refresh_token_exposed": False,
+    }
+    assert "private" not in str(result)

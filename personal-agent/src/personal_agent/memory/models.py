@@ -65,6 +65,7 @@ class MemoryCreate(BaseModel):
     evidence_event_ids: list[str] = Field(default_factory=list, max_length=100)
     retention_days: int | None = Field(default=None, ge=1, le=36_500)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    supersedes_memory_id: str | None = Field(default=None, max_length=128)
 
 
 class MemoryUpdate(BaseModel):
@@ -83,6 +84,7 @@ class MemoryRecord(BaseModel):
     evidence_event_ids: list[str]
     retention_until: str | None
     metadata: dict[str, Any]
+    embedding_state: str = "not_requested"
     created_at: str
     updated_at: str
 

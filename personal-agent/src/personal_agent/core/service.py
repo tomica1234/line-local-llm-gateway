@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from ..audit import AuditLogger
+from ..execution import ExecutionStepStatus, ExecutionStore
 from ..memory.models import EventCreate, TrustLevel
 from ..memory.sanitizer import sanitize_text
 from ..memory.store import MemoryStore
@@ -24,6 +26,7 @@ from ..types import (
     ToolResult,
 )
 from .capabilities import CapabilityStep, build_capability_plan
+from .planner import LLMCapabilityPlanner
 from .state_machine import TERMINAL_STATES, InvalidTransition, TaskStateMachine
 
 
@@ -57,6 +60,8 @@ class AgentService:
         memory: MemoryStore,
         user_id: str,
         timezone: str,
+        execution: ExecutionStore | None = None,
+        task_cancel_handlers: tuple[Callable[[str], object], ...] = (),
     ) -> None:
         self.storage = storage
         self.router = router
@@ -67,6 +72,15 @@ class AgentService:
         self.user_id = user_id
         self.timezone = ZoneInfo(timezone)
         self.states = TaskStateMachine(storage)
+        self.execution = execution or ExecutionStore(storage)
+        self.execution.initialize()
+        self.capability_planner = (
+            LLMCapabilityPlanner(model)
+            if callable(getattr(model, "complete_with_tools", None))
+            else None
+        )
+        self.task_cancel_handlers = task_cancel_handlers
+        self.prompt_version = "agent-core-v3"
 
     async def handle_message(self, request: MessageRequest) -> MessageResponse:
         safe_text, _ = sanitize_text(request.text)
@@ -212,7 +226,11 @@ class AgentService:
             return task
         if task.state is TaskState.COMPLETED:
             raise TaskNotResumable(f"Task {task_id} is already COMPLETED")
-        return self.states.transition(task_id, TaskState.CANCELLED, event_type="task_cancelled")
+        task = self.states.transition(task_id, TaskState.CANCELLED, event_type="task_cancelled")
+        self.execution.cancel_task(task_id)
+        for handler in self.task_cancel_handlers:
+            handler(task_id)
+        return task
 
     def _control_active_task(
         self, request: MessageRequest, decision: RouteDecision
@@ -329,9 +347,51 @@ class AgentService:
         if task.state is not TaskState.UNDERSTANDING:
             raise InvalidTransition(f"Task {task_id} is not ready to execute")
         self.states.transition(task_id, TaskState.PLANNING)
-        capability_plan = (
-            () if decision.route is Route.TIER0 else build_capability_plan(task.goal)
+        existing_steps = self.execution.steps(task_id)
+        planner_evidence: dict[str, object]
+        if existing_steps:
+            proposed_plan = tuple(step.capability() for step in existing_steps)
+            planner_evidence = {
+                "source": "durable_plan",
+                "reason_code": "EXISTING_PLAN_REUSED",
+            }
+        elif decision.route is Route.TIER0:
+            proposed_plan = (
+                CapabilityStep(
+                    step_id="tier0",
+                    purpose="決定論的Intentを実行しEvidenceを確認する",
+                    allowed_tools=frozenset(),
+                    permissions=frozenset(),
+                    risk=task.risk_level,
+                ),
+            )
+            planner_evidence = {"source": "deterministic", "reason_code": "TIER0"}
+        else:
+            if self.capability_planner is None:
+                proposed_plan = build_capability_plan(task.goal)
+                planner_evidence = {
+                    "source": "deterministic",
+                    "reason_code": "MODEL_PLANNER_UNAVAILABLE",
+                }
+            else:
+                proposed_plan, planner_evidence = await self.capability_planner.plan(task.goal)
+        self.audit.record(
+            task_id=task_id,
+            actor="capability_validator",
+            action="capability.plan",
+            result=str(planner_evidence["source"]),
+            details={**planner_evidence, "external_tool_output_used": False},
         )
+        model_id = str(getattr(self.model, "model", type(self.model).__name__))
+        self.execution.ensure_plan(
+            task_id=task_id,
+            goal=task.goal,
+            steps=proposed_plan,
+            model=model_id,
+            prompt_version=self.prompt_version,
+        )
+        step_records = self.execution.steps(task_id)
+        capability_plan = tuple(record.capability() for record in step_records)
         plan = (
             ["決定論的Intentを実行する", "結果をEvidenceで確認する"]
             if decision.route is Route.TIER0
@@ -348,23 +408,44 @@ class AgentService:
             task_id,
             plan=plan,
             event_type="plan_created",
-            event_payload={"steps": plan},
+            event_payload={"steps": plan, "planner": planner_evidence},
         )
         self.states.transition(task_id, TaskState.EXECUTING)
 
         try:
             if decision.route is Route.TIER0:
+                tier0_step = step_records[0] if step_records else None
+                if tier0_step and tier0_step.status is not ExecutionStepStatus.COMPLETED:
+                    self.execution.start_step(
+                        task_id, tier0_step.step_id, input_data={"goal": task.goal}
+                    )
                 text, evidence = await self._run_tier0(
                     task_id,
                     request,
                     decision,
                     evidence_event_id=evidence_event_id,
                 )
+                if tier0_step:
+                    self.execution.set_status(
+                        task_id,
+                        tier0_step.step_id,
+                        ExecutionStepStatus.COMPLETED,
+                        output={"text": text},
+                        evidence=evidence,
+                    )
             else:
                 text, evidence = await self._run_deep(
                     task_id, request, capability_plan=capability_plan
                 )
         except Exception as exc:
+            for step in self.execution.steps(task_id):
+                if step.status is ExecutionStepStatus.RUNNING:
+                    self.execution.set_status(
+                        task_id,
+                        step.step_id,
+                        ExecutionStepStatus.WAITING_EXTERNAL,
+                        evidence={"error_type": type(exc).__name__},
+                    )
             self.storage.update_task(
                 task_id,
                 state=TaskState.WAITING_EXTERNAL,
@@ -651,11 +732,43 @@ class AgentService:
         total_turns = 0
         tools_presented: set[str] = set()
         stop_for_safe_continuation = False
+        persisted = {step.step_id: step for step in self.execution.steps(task_id)}
         for capability in capability_plan:
+            persisted_step = persisted.get(capability.step_id)
+            if persisted_step and persisted_step.status is ExecutionStepStatus.COMPLETED:
+                if persisted_step.output and persisted_step.output.get("text"):
+                    final_text = str(persisted_step.output["text"])
+                tool_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            f"Step {capability.step_id} was durably completed before restart. "
+                            "Do not repeat it. Continue only with later pre-authorized steps."
+                        ),
+                    }
+                )
+                continue
+            if persisted_step and persisted_step.status is ExecutionStepStatus.SUBMITTED_UNKNOWN:
+                deferred_state = TaskState.SUBMITTED_UNKNOWN
+                deferred_reason = "MUTATION_SUBMITTED_UNKNOWN"
+                final_text = "送信結果が不明なため再実行せず、照合を待っています。"
+                break
+            self.execution.start_step(
+                task_id,
+                capability.step_id,
+                input_data={"goal": task.goal, "purpose": capability.purpose},
+            )
             allowed_names = set(capability.allowed_tools)
             granted_permissions = set(capability.permissions)
             schemas = self.broker.schemas(allowed_names, granted_permissions)
             if not schemas:
+                self.execution.set_status(
+                    task_id,
+                    capability.step_id,
+                    ExecutionStepStatus.COMPLETED,
+                    output={"text": final_text},
+                    evidence={"tools_presented": []},
+                )
                 continue
             tools_presented.update(tool["name"] for tool in schemas)
             tool_messages.append(
@@ -702,7 +815,10 @@ class AgentService:
                     }
                 )
                 for call in turn.tool_calls:
-                    if call.name == "browser.screenshot" and not snapshot_attempted:
+                    if (
+                        call.name in {"browser.screenshot", "browser.vision_analyze"}
+                        and not snapshot_attempted
+                    ):
                         result = ToolResult(
                             status="denied",
                             evidence={"reason_code": "DOM_SNAPSHOT_REQUIRED_BEFORE_VISION"},
@@ -743,7 +859,10 @@ class AgentService:
                         )
                     if call.name == "browser.snapshot":
                         snapshot_attempted = True
-                    if call.name == "browser.screenshot" and result.status == "ok":
+                    if (
+                        call.name in {"browser.screenshot", "browser.vision_analyze"}
+                        and result.status == "ok"
+                    ):
                         screenshot_captured = True
                     serialized = result.model_dump(mode="json")
                     if result.requires_approval:
@@ -753,13 +872,16 @@ class AgentService:
                         )
                     elif result.status == "waiting_auth":
                         deferred_state = TaskState.WAITING_AUTH
-                        deferred_reason = str(
-                            result.evidence.get("reason_code", "AUTH_REQUIRED")
-                        )
+                        deferred_reason = str(result.evidence.get("reason_code", "AUTH_REQUIRED"))
                     elif result.status == "waiting_user":
                         deferred_state = TaskState.WAITING_USER
                         deferred_reason = str(
                             result.evidence.get("reason_code", "USER_ACTION_REQUIRED")
+                        )
+                    elif result.status == "waiting_external":
+                        deferred_state = TaskState.WAITING_EXTERNAL
+                        deferred_reason = str(
+                            result.evidence.get("reason_code", "EXTERNAL_JOB_RUNNING")
                         )
                     elif result.status == "submitted_unknown":
                         deferred_state = TaskState.SUBMITTED_UNKNOWN
@@ -807,9 +929,51 @@ class AgentService:
                     ),
                     TaskState.WAITING_AUTH: ("認証が必要です。本人確認後に同じTaskを再開します。"),
                     TaskState.WAITING_USER: ("本人操作が必要です。完了後に同じTaskを再開します。"),
+                    TaskState.WAITING_EXTERNAL: (
+                        "外部Jobを開始しました。進捗は保存され、完了時に通知します。"
+                    ),
                     TaskState.SUBMITTED_UNKNOWN: ("送信結果が不明です。再送せず、まず照合します。"),
                 }.get(deferred_state, "安全な継続条件を待っています。")
+                step_status = {
+                    TaskState.WAITING_APPROVAL: ExecutionStepStatus.WAITING_APPROVAL,
+                    TaskState.WAITING_AUTH: ExecutionStepStatus.WAITING_AUTH,
+                    TaskState.WAITING_USER: ExecutionStepStatus.WAITING_USER,
+                    TaskState.WAITING_EXTERNAL: ExecutionStepStatus.WAITING_EXTERNAL,
+                    TaskState.SUBMITTED_UNKNOWN: ExecutionStepStatus.SUBMITTED_UNKNOWN,
+                }.get(deferred_state, ExecutionStepStatus.WAITING_EXTERNAL)
+                self.execution.set_status(
+                    task_id,
+                    capability.step_id,
+                    step_status,
+                    output={"text": final_text},
+                    evidence={
+                        "deferred_reason": deferred_reason,
+                        "tool_results": [
+                            item
+                            for item in tool_evidence
+                            if item.get("capability_step") == capability.step_id
+                        ],
+                    },
+                )
                 break
+            self.execution.set_status(
+                task_id,
+                capability.step_id,
+                ExecutionStepStatus.COMPLETED,
+                output={"text": final_text},
+                evidence={
+                    "tool_results": [
+                        item
+                        for item in tool_evidence
+                        if item.get("capability_step") == capability.step_id
+                    ],
+                    "model_metrics": [
+                        item
+                        for item in model_metrics
+                        if item.get("capability_step") == capability.step_id
+                    ],
+                },
+            )
             if total_turns >= 12 and capability is not capability_plan[-1]:
                 raise RuntimeError("Model exceeded the maximum of 12 tool-call turns")
         if not final_text:

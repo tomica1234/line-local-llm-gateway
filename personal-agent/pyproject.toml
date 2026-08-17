@@ -14,12 +14,20 @@ dependencies = [
   "pydantic>=2.8,<3",
   "uvicorn[standard]>=0.30,<1",
   "webauthn>=3,<4",
+  "beautifulsoup4>=4.13,<5",
+  "openpyxl>=3.1,<4",
+  "Pillow>=11,<13",
+  "pypdf>=5.9,<7",
+  "pymupdf>=1.25,<2",
+  "psutil>=6,<8",
+  "python-docx>=1.2,<2",
+  "python-pptx>=1.0,<2",
 ]
 
 [project.optional-dependencies]
 dev = [
-  "pytest>=8.2,<9",
-  "pytest-asyncio>=0.23,<1",
+  "pytest>=9.0.3,<10",
+  "pytest-asyncio>=1,<2",
   "ruff>=0.8,<1",
 ]
 voice = [
@@ -31,7 +39,7 @@ browser-worker = [
   "playwright>=1.54,<2",
 ]
 auth = [
-  "cryptography>=45,<47",
+  "cryptography>=45,<51",
 ]
 line-desktop = [
   "Pillow>=11,<12",
@@ -64,6 +72,11 @@ addopts = "-q"
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
+markers = [
+  "e2e: local end-to-end profile without real credentials or devices",
+  "real_device: requires a Windows/iPhone device and is excluded from CI",
+  "real_credential: requires operator-owned provider credentials and is excluded from CI",
+]
 
 [tool.ruff]
 line-length = 100

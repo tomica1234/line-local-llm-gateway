@@ -25,12 +25,27 @@
       </section>
 
       <nav class="tabs" aria-label="画面切り替え">
+        <button class="tab" data-tab="today">Today</button>
         <button class="tab active" data-tab="chat">Chat</button>
-        <button class="tab" data-tab="tasks">Tasks <span id="task-count">0</span></button>
+        <button class="tab" data-tab="todo">Todo</button>
+        <button class="tab" data-tab="diary">Diary</button>
+        <button class="tab" data-tab="calendar">Calendar</button>
+        <button class="tab" data-tab="inbox">Inbox</button>
+        <button class="tab" data-tab="files">Files</button>
+        <button class="tab" data-tab="tasks">Agent Tasks <span id="task-count">0</span></button>
+        <button class="tab" data-tab="approvals">Approvals</button>
         <button class="tab" data-tab="memory">Memory</button>
         <button class="tab" data-tab="controls">Safety</button>
         <button class="tab" data-tab="ops">Ops</button>
       </nav>
+
+      <section id="today" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">DAILY BRIEFING</p><h2>Today</h2></div>
+          <button id="refresh-today" class="secondary" type="button">更新</button>
+        </div>
+        <div id="today-summary" class="dashboard-grid"></div>
+      </section>
 
       <section id="chat" class="panel active">
         <div id="continuation" class="continuation hidden">
@@ -50,12 +65,87 @@
         </form>
       </section>
 
+      <section id="todo" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">PERSONAL TODO</p><h2>Todo</h2></div>
+          <button id="refresh-todos" class="secondary" type="button">更新</button>
+        </div>
+        <form id="todo-create-form" class="entity-form">
+          <input id="todo-title" maxlength="500" placeholder="やること" required />
+          <select id="todo-type" aria-label="種別"><option value="must">Must</option><option value="want">Want</option></select>
+          <select id="todo-priority" aria-label="優先度"><option value="normal">Normal</option><option value="high">High</option><option value="low">Low</option></select>
+          <label>期限<input id="todo-due" type="datetime-local" /></label>
+          <label>通知<input id="todo-remind" type="datetime-local" /></label>
+          <button type="submit">追加</button>
+        </form>
+        <div class="filter-row">
+          <button class="secondary" data-todo-filter="open" type="button">未完了</button>
+          <button class="secondary" data-todo-filter="completed" type="button">完了</button>
+          <button class="secondary" data-todo-filter="all" type="button">すべて</button>
+        </div>
+        <div id="todo-list" class="record-list"></div>
+      </section>
+
+      <section id="diary" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">REFLECTION</p><h2>Diary</h2></div>
+        </div>
+        <form id="diary-create-form" class="entity-form diary-form">
+          <label>日付<input id="diary-date" type="date" /></label>
+          <label>気分<select id="diary-mood"><option value="">未選択</option><option value="5">5</option><option value="4">4</option><option value="3">3</option><option value="2">2</option><option value="1">1</option></select></label>
+          <textarea id="diary-summary" maxlength="10000" placeholder="今日のまとめ" required></textarea>
+          <input id="diary-tags" maxlength="500" placeholder="タグ（カンマ区切り）" />
+          <button type="submit">記録</button>
+        </form>
+        <form id="diary-search-form" class="search-box"><input id="diary-search" maxlength="2000" placeholder="日記を検索" /><button type="submit">検索</button></form>
+        <div id="diary-list" class="record-list"></div>
+      </section>
+
+      <section id="calendar" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">LOCAL + PROVIDERS</p><h2>Calendar</h2></div>
+          <div class="card-actions"><button id="calendar-prev" class="secondary" type="button">前週</button><button id="calendar-next" class="secondary" type="button">次週</button></div>
+        </div>
+        <div id="calendar-provider-list" class="provider-strip"></div>
+        <div id="calendar-range" class="muted"></div>
+        <div id="calendar-list" class="record-list"></div>
+      </section>
+
+      <section id="inbox" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">COMMUNICATION</p><h2>Inbox</h2></div>
+          <button id="refresh-inbox" class="secondary" type="button">更新</button>
+        </div>
+        <form id="inbox-search-form" class="search-box"><input id="inbox-search" maxlength="2000" placeholder="メール・LINEを検索" /><button type="submit">検索</button></form>
+        <div id="inbox-list" class="record-list"></div>
+      </section>
+
+      <section id="files" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">ALLOWLISTED ROOTS</p><h2>Files</h2></div>
+          <button id="refresh-files" class="secondary" type="button">最近のファイル</button>
+        </div>
+        <p class="muted">PDF・画像・Office・HTML・ZIPを、安全な解析パイプラインで扱います。</p>
+        <form id="file-search-form" class="search-box"><input id="file-search" maxlength="2000" placeholder="ファイル名を検索" /><button type="submit">検索</button></form>
+        <div id="file-list" class="record-list"></div>
+        <pre id="file-preview" class="evidence hidden"></pre>
+      </section>
+
       <section id="tasks" class="panel">
         <div class="section-heading">
           <div><p class="eyebrow">DURABLE STATE</p><h2>Task Timeline</h2></div>
           <button id="refresh-tasks" class="secondary" type="button">更新</button>
         </div>
         <div id="task-list" class="task-list"></div>
+      </section>
+
+      <section id="approvals" class="panel">
+        <div class="section-heading">
+          <div><p class="eyebrow">HUMAN-READABLE</p><h2>Approvals</h2></div>
+          <button id="refresh-approvals" class="secondary" type="button">更新</button>
+        </div>
+        <p class="muted">宛先・本文・金額・送信先など、実行される内容に固定された一回限りの承認です。</p>
+        <div id="approval-list-main" class="pending-list"></div>
       </section>
 
       <section id="memory" class="panel">

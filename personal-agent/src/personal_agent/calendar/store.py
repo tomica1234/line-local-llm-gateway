@@ -7,6 +7,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from ..memory.sanitizer import sanitize_text
+from ..migrations import Migration, add_column, apply_migrations
 from ..storage import Storage, utc_now
 from .models import CalendarEventCreate, CalendarEventRecord, CalendarEventUpdate
 
@@ -21,6 +22,8 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     description TEXT NOT NULL,
     status TEXT NOT NULL,
     recurrence_json TEXT,
+    attendees_json TEXT NOT NULL DEFAULT '[]',
+    reminders_json TEXT NOT NULL DEFAULT '[]',
     linked_economic_intent_id TEXT,
     source_reference TEXT,
     created_at TEXT NOT NULL,
@@ -31,7 +34,32 @@ ON calendar_events(status, start_at, end_at);
 CREATE VIRTUAL TABLE IF NOT EXISTS calendar_fts USING fts5(
     event_id UNINDEXED, title, location, description, tokenize='trigram'
 );
+CREATE TABLE IF NOT EXISTS calendar_provider_state (
+    provider TEXT PRIMARY KEY,
+    sync_token TEXT,
+    status TEXT NOT NULL,
+    last_synced_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL
+);
 """
+
+
+def _calendar_v2(connection: Any) -> None:
+    add_column(connection, "calendar_events", "attendees_json TEXT NOT NULL DEFAULT '[]'")
+    add_column(connection, "calendar_events", "reminders_json TEXT NOT NULL DEFAULT '[]'")
+    add_column(connection, "calendar_events", "provider TEXT NOT NULL DEFAULT 'local'")
+    add_column(connection, "calendar_events", "external_event_id TEXT")
+    add_column(connection, "calendar_events", "external_version TEXT")
+    add_column(connection, "calendar_events", "last_synced_at TEXT")
+    add_column(connection, "calendar_events", "sync_state TEXT NOT NULL DEFAULT 'local_only'")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_calendar_provider_external "
+        "ON calendar_events(provider, external_event_id) WHERE external_event_id IS NOT NULL"
+    )
+
+
+CALENDAR_MIGRATIONS = (Migration(2, "provider-sync-and-approval-fields", _calendar_v2),)
 
 
 class CalendarConflict(ValueError):
@@ -48,6 +76,7 @@ class CalendarStore:
     def initialize(self) -> None:
         with self.storage.transaction() as connection:
             connection.executescript(CALENDAR_SCHEMA)
+            apply_migrations(connection, component="calendar", migrations=CALENDAR_MIGRATIONS)
 
     def search(
         self,
@@ -115,8 +144,9 @@ class CalendarStore:
             connection.execute(
                 "INSERT INTO calendar_events "
                 "(event_id, title, start_at, end_at, timezone, location, description, status, "
-                "recurrence_json, linked_economic_intent_id, source_reference, created_at, "
-                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "recurrence_json, attendees_json, reminders_json, linked_economic_intent_id, "
+                "source_reference, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     event_id,
                     safe_title,
@@ -127,6 +157,8 @@ class CalendarStore:
                     safe_description,
                     event.status.value,
                     json.dumps(recurrence) if recurrence else None,
+                    json.dumps(event.attendees, ensure_ascii=False),
+                    json.dumps(event.reminders),
                     event.linked_economic_intent_id,
                     event.source_reference,
                     now,
@@ -173,10 +205,14 @@ class CalendarStore:
             if update.recurrence is not None
             else current.recurrence
         )
+        attendees = update.attendees if update.attendees is not None else current.attendees
+        reminders = update.reminders if update.reminders is not None else current.reminders
         with self.storage.transaction() as connection:
             connection.execute(
                 "UPDATE calendar_events SET title=?, start_at=?, end_at=?, location=?, "
-                "description=?, recurrence_json=?, updated_at=? WHERE event_id=?",
+                "description=?, recurrence_json=?, attendees_json=?, reminders_json=?, "
+                "sync_state=CASE WHEN provider='local' THEN sync_state ELSE 'pending_update' END, "
+                "updated_at=? WHERE event_id=?",
                 (
                     title,
                     start_at.isoformat(),
@@ -184,6 +220,8 @@ class CalendarStore:
                     location,
                     description,
                     json.dumps(recurrence) if recurrence else None,
+                    json.dumps(attendees, ensure_ascii=False),
+                    json.dumps(reminders),
                     utc_now(),
                     event_id,
                 ),
@@ -210,6 +248,115 @@ class CalendarStore:
                 raise ValueError("Calendar event could not be cancelled")
         return self.get(event_id)
 
+    def provider_state(self, provider: str) -> dict[str, Any]:
+        with self.storage.read_connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM calendar_provider_state WHERE provider=?", (provider,)
+            ).fetchone()
+        return (
+            dict(row)
+            if row
+            else {
+                "provider": provider,
+                "sync_token": None,
+                "status": "not_synced",
+                "last_synced_at": None,
+                "last_error": None,
+            }
+        )
+
+    def record_provider_state(
+        self,
+        provider: str,
+        *,
+        status: str,
+        sync_token: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        now = utc_now()
+        with self.storage.transaction() as connection:
+            connection.execute(
+                "INSERT INTO calendar_provider_state(provider, sync_token, status, "
+                "last_synced_at, last_error, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(provider) DO UPDATE SET sync_token=COALESCE(excluded.sync_token, "
+                "calendar_provider_state.sync_token), status=excluded.status, "
+                "last_synced_at=excluded.last_synced_at, last_error=excluded.last_error, "
+                "updated_at=excluded.updated_at",
+                (provider, sync_token, status, now if status == "ok" else None, error, now),
+            )
+
+    def upsert_provider_event(self, value: dict[str, Any]) -> dict[str, Any]:
+        provider = str(value["provider"])
+        external_id = str(value["external_event_id"])
+        version = value.get("version")
+        now = utc_now()
+        with self.storage.transaction() as connection:
+            current = connection.execute(
+                "SELECT * FROM calendar_events WHERE provider=? AND external_event_id=?",
+                (provider, external_id),
+            ).fetchone()
+            if current and current["external_version"] == version:
+                return {"state": "unchanged", "event_id": current["event_id"]}
+            if current and current["sync_state"] in {"pending_update", "pending_cancel"}:
+                connection.execute(
+                    "UPDATE calendar_events SET sync_state='conflict', updated_at=? "
+                    "WHERE event_id=?",
+                    (now, current["event_id"]),
+                )
+                return {"state": "conflict", "event_id": current["event_id"]}
+            event_id = str(current["event_id"]) if current else str(uuid.uuid4())
+            safe_title = sanitize_text(str(value.get("title") or "(no title)"))[0]
+            safe_description = sanitize_text(str(value.get("description") or ""))[0]
+            safe_location = (
+                sanitize_text(str(value["location"]))[0] if value.get("location") else None
+            )
+            recurrence = value.get("recurrence") or None
+            connection.execute(
+                "INSERT INTO calendar_events(event_id, title, start_at, end_at, timezone, "
+                "location, description, status, recurrence_json, attendees_json, reminders_json, "
+                "provider, external_event_id, external_version, last_synced_at, sync_state, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "'synced', ?, ?) ON CONFLICT(event_id) DO UPDATE SET title=excluded.title, "
+                "start_at=excluded.start_at, end_at=excluded.end_at, timezone=excluded.timezone, "
+                "location=excluded.location, description=excluded.description, "
+                "status=excluded.status, recurrence_json=excluded.recurrence_json, "
+                "attendees_json=excluded.attendees_json, reminders_json=excluded.reminders_json, "
+                "external_version=excluded.external_version, "
+                "last_synced_at=excluded.last_synced_at, "
+                "sync_state='synced', updated_at=excluded.updated_at",
+                (
+                    event_id,
+                    safe_title,
+                    value["start_at"],
+                    value["end_at"],
+                    value.get("timezone") or "Asia/Tokyo",
+                    safe_location,
+                    safe_description,
+                    (
+                        "cancelled"
+                        if value.get("status") == "cancelled"
+                        else value.get("status", "confirmed")
+                    ),
+                    json.dumps(recurrence, ensure_ascii=False) if recurrence else None,
+                    json.dumps(value.get("attendees") or [], ensure_ascii=False),
+                    json.dumps(value.get("reminders") or []),
+                    provider,
+                    external_id,
+                    version,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute("DELETE FROM calendar_fts WHERE event_id=?", (event_id,))
+            if value.get("status") != "cancelled":
+                connection.execute(
+                    "INSERT INTO calendar_fts(event_id, title, location, description) "
+                    "VALUES (?, ?, ?, ?)",
+                    (event_id, safe_title, safe_location or "", safe_description),
+                )
+        return {"state": "created" if current is None else "updated", "event_id": event_id}
+
     @staticmethod
     def _validate_interval(start_at: datetime, end_at: datetime) -> None:
         if start_at.tzinfo is None or end_at.tzinfo is None:
@@ -229,8 +376,15 @@ class CalendarStore:
             description=row["description"],
             status=row["status"],
             recurrence=json.loads(row["recurrence_json"]) if row["recurrence_json"] else None,
+            attendees=json.loads(row["attendees_json"]) if row["attendees_json"] else [],
+            reminders=json.loads(row["reminders_json"]) if row["reminders_json"] else [],
             linked_economic_intent_id=row["linked_economic_intent_id"],
             source_reference=row["source_reference"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            provider=row["provider"],
+            external_event_id=row["external_event_id"],
+            external_version=row["external_version"],
+            last_synced_at=row["last_synced_at"],
+            sync_state=row["sync_state"],
         )

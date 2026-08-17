@@ -3,6 +3,13 @@ const state = {
   continuationTaskId: null,
   passkeyAuthenticated: false,
   chatBusy: false,
+  todoFilter: "open",
+  calendarStart: (() => {
+    const value = new Date();
+    value.setHours(0, 0, 0, 0);
+    value.setDate(value.getDate() - ((value.getDay() + 6) % 7));
+    return value;
+  })(),
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -177,6 +184,16 @@ function activateTab(name) {
   document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
   document.querySelectorAll(".panel").forEach((panel) => panel.classList.toggle("active", panel.id === name));
   history.replaceState(null, "", `#${name}`);
+  const loaders = {
+    today: loadToday,
+    todo: loadTodos,
+    diary: loadDiary,
+    calendar: loadCalendar,
+    inbox: loadInbox,
+    files: loadFiles,
+    approvals: loadPending,
+  };
+  if (loaders[name]) loaders[name]().catch((error) => console.debug(`${name} load failed`, error));
 }
 
 document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => activateTab(tab.dataset.tab)));
@@ -443,6 +460,8 @@ async function showTask(taskId) {
     <p><span class="task-state">${escapeHtml(task.state)}</span></p>
     <h3>${escapeHtml(task.goal)}</h3>
     <p class="muted"><code>${escapeHtml(task.task_id)}</code><br>${escapeHtml(task.source)} · ${escapeHtml(task.route || "pending")} · ${escapeHtml(task.risk_level)}</p>
+    <h3>Execution steps</h3>
+    <div class="step-list">${detail.steps.length ? detail.steps.map((step) => `<article class="step-row"><strong>${escapeHtml(step.status)} · ${escapeHtml(step.purpose)}</strong><small>${escapeHtml(step.step_id)} · ${escapeHtml(step.risk)} · attempt ${step.attempt}<br>Tools: ${escapeHtml(step.allowed_tools.join(", ") || "none")}</small></article>`).join("") : '<p class="muted">Durable stepはありません。</p>'}</div>
     <h3>Timeline</h3>
     <div class="timeline">${detail.events.map((event) => `<article><strong>${escapeHtml(event.event_type)}</strong><p>${escapeHtml(event.state || "")}</p><time>${new Date(event.created_at).toLocaleString("ja-JP")}</time></article>`).join("")}</div>
     <h3>Result & Evidence</h3>
@@ -516,17 +535,7 @@ async function loadPending() {
       api("/api/approvals?state=pending", { headers }),
       api("/api/auth/sessions", { headers }).catch(() => []),
     ]);
-    approvalList.replaceChildren();
-    for (const approval of approvals) {
-      const row = document.createElement("article");
-      row.className = "pending-row";
-      row.innerHTML = `<div><span class="task-state">${escapeHtml(approval.risk_level)}</span><strong>${escapeHtml(approval.tool_name)}</strong><p>${escapeHtml(approval.reason)}</p><small>${escapeHtml(JSON.stringify(approval.input_summary))}</small></div><div class="card-actions"><button data-approve type="button">承認</button><button data-deny class="danger" type="button">拒否</button></div>`;
-      if (["R4", "R5"].includes(approval.risk_level)) row.querySelector("[data-approve]").textContent = "Face IDで承認";
-      row.querySelector("[data-approve]").addEventListener("click", () => decideApproval(approval, true));
-      row.querySelector("[data-deny]").addEventListener("click", () => decideApproval(approval, false));
-      approvalList.append(row);
-    }
-    if (!approvals.length) approvalList.innerHTML = '<p class="muted">承認待ちはありません。</p>';
+    renderApprovals(approvals, [approvalList, $("#approval-list-main")]);
 
     const pendingAuth = sessions.filter((session) => session.state === "WAITING_OTP");
     authList.replaceChildren();
@@ -541,6 +550,29 @@ async function loadPending() {
   } catch (error) {
     approvalList.innerHTML = `<p class="muted">${escapeHtml(error.message)}</p>`;
     authList.replaceChildren();
+  }
+}
+
+function materialFields(payload) {
+  return Object.entries(payload || {}).map(([key, value]) =>
+    `<dt>${escapeHtml(key)}</dt><dd>${escapeHtml(typeof value === "string" ? value : JSON.stringify(value, null, 2))}</dd>`
+  ).join("");
+}
+
+function renderApprovals(approvals, targets) {
+  for (const target of targets.filter(Boolean)) {
+    target.replaceChildren();
+    for (const approval of approvals) {
+      const material = approval.material || {};
+      const row = document.createElement("article");
+      row.className = "pending-row";
+      row.innerHTML = `<div><span class="task-state">${escapeHtml(approval.risk_level)}</span><strong>${escapeHtml(material.title || approval.tool_name)}</strong><p>${escapeHtml(approval.reason)}</p><section class="approval-material"><h4>${escapeHtml(material.action_type || approval.tool_name)}</h4><p>${escapeHtml(material.human_summary || "内容を確認してください")}</p><dl>${materialFields(material.structured_payload || approval.input_summary)}</dl></section><small>一回限り · hash ${escapeHtml((material.material_hash || approval.material_hash || "").slice(0, 12))}</small></div><div class="card-actions"><button data-approve type="button">承認</button><button data-deny class="danger" type="button">拒否</button></div>`;
+      if (["R4", "R5"].includes(approval.risk_level)) row.querySelector("[data-approve]").textContent = "Face IDで承認";
+      row.querySelector("[data-approve]").addEventListener("click", () => decideApproval(approval, true));
+      row.querySelector("[data-deny]").addEventListener("click", () => decideApproval(approval, false));
+      target.append(row);
+    }
+    if (!approvals.length) target.innerHTML = '<p class="muted">承認待ちはありません。</p>';
   }
 }
 
@@ -940,6 +972,155 @@ $("#delete-data").addEventListener("click", async () => {
   } catch (error) { alert(error.message); }
 });
 
+function localDate(value = new Date()) {
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function dateValueOrNull(selector) {
+  const value = $(selector).value;
+  return value ? new Date(value).toISOString() : null;
+}
+
+function dashboardCard(title, values, render) {
+  const body = values.length
+    ? `<ul>${values.map((value) => `<li>${render(value)}</li>`).join("")}</ul>`
+    : '<p class="muted">ありません。</p>';
+  return `<article class="dashboard-card"><h3>${escapeHtml(title)}</h3>${body}</article>`;
+}
+
+async function loadToday() {
+  const value = await api("/api/today");
+  $("#today-summary").innerHTML = [
+    dashboardCard("今日の予定", value.calendar, (item) => `${escapeHtml(item.title)} <small>${new Date(item.start_at).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })}</small>`),
+    dashboardCard("Must", value.must, (item) => escapeHtml(item.title)),
+    dashboardCard("Want", value.want, (item) => escapeHtml(item.title)),
+    dashboardCard("Reminders", value.reminders, (item) => `${escapeHtml(item.payload?.label || item.kind)} <small>${new Date(item.run_at).toLocaleString("ja-JP")}</small>`),
+    dashboardCard("Agent suggestions", value.suggestions, (item) => `${escapeHtml(item.summary)} <small>${escapeHtml(item.attention)}</small>`),
+  ].join("");
+}
+
+async function loadTodos() {
+  const query = state.todoFilter === "all" ? "" : `?status=${state.todoFilter}`;
+  const values = await api(`/api/todos${query}`);
+  const list = $("#todo-list");
+  list.innerHTML = values.length ? values.map((item) => `<article class="record-row" data-todo-id="${escapeHtml(item.todo_id)}"><div><span class="task-state">${escapeHtml(item.todo_type)} · ${escapeHtml(item.priority)}</span><h3>${escapeHtml(item.title)}</h3><small>期限 ${item.due_at ? new Date(item.due_at).toLocaleString("ja-JP") : "なし"} · 通知 ${item.remind_at ? new Date(item.remind_at).toLocaleString("ja-JP") : "なし"}${item.recurrence ? ` · ${escapeHtml(item.recurrence.frequency)}` : ""}</small></div><div class="card-actions">${item.status === "open" ? '<button data-complete type="button">完了</button><button data-edit type="button">編集</button><button data-snooze="30" type="button">30分</button><button data-snooze="60" type="button">1時間</button>' : ""}<button data-delete class="danger" type="button">削除</button></div></article>`).join("") : '<p class="muted">該当するTodoはありません。</p>';
+  list.querySelectorAll("[data-todo-id]").forEach((row) => {
+    const id = row.dataset.todoId;
+    row.querySelector("[data-complete]")?.addEventListener("click", () => mutateTodo(`/api/todos/${id}/complete`, { method: "POST", body: "{}" }));
+    row.querySelector("[data-delete]")?.addEventListener("click", () => {
+      if (confirm("Todoと未発火の通知を削除しますか？")) mutateTodo(`/api/todos/${id}`, { method: "DELETE" });
+    });
+    row.querySelector("[data-edit]")?.addEventListener("click", async () => {
+      const title = prompt("Todoを編集", row.querySelector("h3").textContent);
+      if (title) await mutateTodo(`/api/todos/${id}`, { method: "PATCH", body: JSON.stringify({ title }) });
+    });
+    row.querySelectorAll("[data-snooze]").forEach((button) => button.addEventListener("click", async () => {
+      const until = new Date(Date.now() + Number(button.dataset.snooze) * 60000).toISOString();
+      await mutateTodo(`/api/todos/${id}/snooze`, { method: "POST", body: JSON.stringify({ until }) });
+    }));
+  });
+}
+
+async function mutateTodo(path, options) {
+  await api(path, options);
+  await Promise.all([loadTodos(), loadToday()]);
+}
+
+$("#todo-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await api("/api/todos", {
+    method: "POST",
+    body: JSON.stringify({
+      type: $("#todo-type").value,
+      title: $("#todo-title").value.trim(),
+      priority: $("#todo-priority").value,
+      due_at: dateValueOrNull("#todo-due"),
+      remind_at: dateValueOrNull("#todo-remind"),
+    }),
+  });
+  event.currentTarget.reset();
+  await Promise.all([loadTodos(), loadToday()]);
+});
+$("#refresh-todos").addEventListener("click", () => loadTodos().catch((error) => alert(error.message)));
+document.querySelectorAll("[data-todo-filter]").forEach((button) => button.addEventListener("click", () => {
+  state.todoFilter = button.dataset.todoFilter;
+  loadTodos().catch((error) => alert(error.message));
+}));
+$("#refresh-today").addEventListener("click", () => loadToday().catch((error) => alert(error.message)));
+
+async function loadDiary(query = "") {
+  const url = query ? `/api/diary?q=${encodeURIComponent(query)}` : `/api/diary?date=${localDate()}`;
+  const entries = await api(url);
+  $("#diary-list").innerHTML = entries.length ? entries.map((item) => `<article class="record-row"><div><span class="task-state">${escapeHtml(item.date)}${item.mood ? ` · mood ${item.mood}` : ""}</span><h3>${escapeHtml(item.summary)}</h3><small>${escapeHtml(item.tags.join(", ") || "タグなし")}</small></div></article>`).join("") : '<p class="muted">日記はまだありません。</p>';
+}
+$("#diary-date").value = localDate();
+$("#diary-create-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await api("/api/diary", { method: "POST", body: JSON.stringify({
+    date: $("#diary-date").value || null,
+    summary: $("#diary-summary").value.trim(),
+    mood: $("#diary-mood").value ? Number($("#diary-mood").value) : null,
+    tags: $("#diary-tags").value.split(",").map((item) => item.trim()).filter(Boolean),
+  }) });
+  $("#diary-summary").value = "";
+  $("#diary-tags").value = "";
+  await loadDiary();
+});
+$("#diary-search-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  loadDiary($("#diary-search").value.trim()).catch((error) => alert(error.message));
+});
+
+async function loadCalendar() {
+  const start = new Date(state.calendarStart);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 7);
+  const [events, providers] = await Promise.all([
+    api(`/api/calendar/events?start_at=${encodeURIComponent(start.toISOString())}&end_at=${encodeURIComponent(end.toISOString())}`),
+    api("/api/calendar/providers"),
+  ]);
+  $("#calendar-range").textContent = `${start.toLocaleDateString("ja-JP")} — ${new Date(end.getTime() - 1).toLocaleDateString("ja-JP")}`;
+  $("#calendar-list").innerHTML = events.length ? events.map((item) => `<article class="record-row"><div><span class="task-state">${escapeHtml(item.provider)} · ${escapeHtml(item.sync_state)}</span><h3>${escapeHtml(item.title)}</h3><small>${new Date(item.start_at).toLocaleString("ja-JP")} — ${new Date(item.end_at).toLocaleString("ja-JP")}<br>${escapeHtml(item.location || "")}</small></div></article>`).join("") : '<p class="muted">この週の予定はありません。</p>';
+  const strip = $("#calendar-provider-list");
+  strip.innerHTML = providers.map((item) => `<button data-calendar-sync="${escapeHtml(item.provider)}" type="button">${escapeHtml(item.provider)} · ${escapeHtml(item.status)}</button>`).join("");
+  strip.querySelectorAll("[data-calendar-sync]").forEach((button) => button.addEventListener("click", async () => {
+    if (!hasAdminAccess()) return alert("同期にはAdmin TokenまたはPasskeyが必要です。");
+    await api("/api/calendar/sync", { method: "POST", headers: adminHeaders(), body: JSON.stringify({ provider: button.dataset.calendarSync }) });
+    await loadCalendar();
+  }));
+}
+$("#calendar-prev").addEventListener("click", () => { state.calendarStart.setDate(state.calendarStart.getDate() - 7); loadCalendar().catch((error) => alert(error.message)); });
+$("#calendar-next").addEventListener("click", () => { state.calendarStart.setDate(state.calendarStart.getDate() + 7); loadCalendar().catch((error) => alert(error.message)); });
+
+function renderInbox(values) {
+  $("#inbox-list").innerHTML = values.length ? values.map((item) => `<article class="record-row"><div><span class="task-state">${escapeHtml(item.source)}${item.labels.length ? ` · ${escapeHtml(item.labels.join(", "))}` : ""}</span><h3>${escapeHtml(item.sender_entity_id || item.conversation_id)}</h3><p>${escapeHtml(item.text)}</p><small>${new Date(item.timestamp).toLocaleString("ja-JP")} · attachments ${item.attachments.length}</small></div></article>`).join("") : '<p class="muted">メッセージはありません。</p>';
+}
+async function loadInbox(query = "") {
+  renderInbox(await api(query ? `/api/communication/search?q=${encodeURIComponent(query)}` : "/api/inbox"));
+}
+$("#refresh-inbox").addEventListener("click", () => loadInbox().catch((error) => alert(error.message)));
+$("#inbox-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadInbox($("#inbox-search").value.trim()).catch((error) => alert(error.message)); });
+
+function renderFiles(files) {
+  const list = $("#file-list");
+  list.innerHTML = files.length ? files.map((item) => `<article class="record-row" data-file-path="${escapeHtml(item.path)}"><div><h3>${escapeHtml(item.name)}</h3><small>${escapeHtml(item.path)} · ${Number(item.size).toLocaleString()} bytes · ${new Date(item.modified_at * 1000).toLocaleString("ja-JP")}</small></div><div class="card-actions"><button data-inspect type="button">解析</button></div></article>`).join("") : '<p class="muted">ファイルはありません。</p>';
+  list.querySelectorAll("[data-file-path]").forEach((row) => row.querySelector("[data-inspect]").addEventListener("click", async () => {
+    const result = await api("/api/files/extract-text", { method: "POST", headers: adminHeaders(), body: JSON.stringify({ path: row.dataset.filePath }) });
+    $("#file-preview").classList.remove("hidden");
+    $("#file-preview").textContent = JSON.stringify(result, null, 2);
+  }));
+}
+async function loadFiles(query = "") {
+  if (!hasAdminAccess()) throw new Error("FilesにはAdmin TokenまたはPasskeyが必要です。");
+  renderFiles(await api(query ? `/api/files/search?q=${encodeURIComponent(query)}` : "/api/files/recent", { headers: adminHeaders() }));
+}
+$("#refresh-files").addEventListener("click", () => loadFiles().catch((error) => alert(error.message)));
+$("#file-search-form").addEventListener("submit", (event) => { event.preventDefault(); loadFiles($("#file-search").value.trim()).catch((error) => alert(error.message)); });
+$("#refresh-approvals").addEventListener("click", () => loadPending().catch((error) => alert(error.message)));
+
 $("#passkey-register-form").addEventListener("submit", (event) =>
   registerPasskey(event).catch((error) => alert(error.message)));
 $("#passkey-login").addEventListener("click", () =>
@@ -950,10 +1131,14 @@ $("#admin-token").addEventListener("change", () =>
   loadPasskeyStatus().catch((error) => console.debug("Passkey status failed", error)));
 
 const initialTab = location.hash.slice(1);
-if (["chat", "tasks", "memory", "controls", "ops"].includes(initialTab)) activateTab(initialTab);
+if ([
+  "today", "chat", "todo", "diary", "calendar", "inbox", "files",
+  "tasks", "approvals", "memory", "controls", "ops",
+].includes(initialTab)) activateTab(initialTab);
 async function refreshPrimaryData() {
   await Promise.allSettled([
-    loadTasks(), loadMemory(), loadLocks(), loadActivityStatus(), loadProactive(),
+    loadToday(), loadTodos(), loadDiary(), loadCalendar(), loadInbox(), loadTasks(),
+    loadMemory(), loadLocks(), loadActivityStatus(), loadProactive(),
   ]);
 }
 

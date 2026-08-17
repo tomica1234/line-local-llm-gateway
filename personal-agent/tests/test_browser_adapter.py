@@ -7,6 +7,7 @@ import pytest
 
 from personal_agent.audit import AuditLogger
 from personal_agent.browser.tools import browser_tools
+from personal_agent.browser_worker.adapters import AdapterPage, SiteAdapterRegistry
 from personal_agent.browser_worker.models import ActionContext, BrowserAction, BrowserProfile
 from personal_agent.config import Settings
 from personal_agent.policy.engine import PolicyEngine
@@ -146,3 +147,18 @@ def test_remote_browser_worker_is_rejected_by_default(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="Remote endpoint"):
         settings.validate_browser_worker_endpoint()
+
+
+def test_site_adapter_is_read_only_and_extracts_confirmation() -> None:
+    page = AdapterPage(
+        url="https://booking.test/confirmation",
+        title="Reservation confirmation",
+        text="Booking number: ABC-12345 Total: JPY 11,000 Log out",
+    )
+    adapter = SiteAdapterRegistry.defaults().resolve(page)
+
+    assert adapter is not None
+    assert adapter.login_state(page) == "authenticated"
+    evidence = adapter.extract_confirmation(page)
+    assert evidence["confirmation_number"] == "ABC-12345"
+    assert evidence["total"] == "11000"

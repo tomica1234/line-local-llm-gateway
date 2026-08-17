@@ -190,9 +190,7 @@ async def test_username_then_password_login_uses_encrypted_bundle(tmp_path: Path
             value,
         )
 
-    result = await service.ensure(
-        BrowserProfile.GENERAL, account_label="main", context=_context()
-    )
+    result = await service.ensure(BrowserProfile.GENERAL, account_label="main", context=_context())
 
     assert result.status == "authenticated"
     assert browser.fills == [

@@ -5,10 +5,12 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..approval import ApprovalMaterial
 from ..tool_broker.broker import ToolContext, ToolDefinition
 from ..types import RiskLevel, ToolResult
 from .models import CalendarEventCreate, CalendarEventUpdate
 from .store import CalendarConflict, CalendarStore
+from .sync import CalendarSyncService
 
 
 class SearchArgs(BaseModel):
@@ -44,7 +46,63 @@ class EventIdArgs(BaseModel):
     event_id: str = Field(min_length=1, max_length=128)
 
 
-def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
+class ProviderSyncArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    provider: str = Field(pattern=r"^[a-z][a-z0-9_-]{1,50}$")
+
+
+def calendar_tools(
+    store: CalendarStore, sync_service: CalendarSyncService | None = None
+) -> list[ToolDefinition[Any]]:
+    def material_payload(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "event_title": value.get("title"),
+            "start": value.get("start_at"),
+            "end": value.get("end_at"),
+            "timezone": value.get("timezone"),
+            "location": value.get("location"),
+            "attendees": value.get("attendees", []),
+            "description": value.get("description", ""),
+            "recurrence": value.get("recurrence"),
+            "reminders": value.get("reminders", []),
+            "event_id": value.get("event_id"),
+            "operation": value.get("operation"),
+        }
+
+    def create_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = CreateArgs.model_validate(args)
+        payload = material_payload(parsed.model_dump(mode="json"))
+        return ApprovalMaterial.create(
+            action_type="calendar.create",
+            title=f"予定「{parsed.title}」を作成",
+            human_summary=f"{parsed.start_at.isoformat()}から予定を作成します。",
+            structured_payload=payload,
+        )
+
+    def update_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = UpdateArgs.model_validate(args)
+        current = store.get(parsed.event_id).model_dump(mode="json")
+        changes = parsed.update.model_dump(exclude_unset=True, mode="json")
+        current.update(changes)
+        current["operation"] = "update"
+        return ApprovalMaterial.create(
+            action_type="calendar.update",
+            title=f"予定「{current['title']}」を更新",
+            human_summary="表示された変更後の予定内容で更新します。",
+            structured_payload=material_payload(current),
+        )
+
+    def cancel_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = EventIdArgs.model_validate(args)
+        current = store.get(parsed.event_id).model_dump(mode="json")
+        current["operation"] = "cancel"
+        return ApprovalMaterial.create(
+            action_type="calendar.cancel",
+            title=f"予定「{current['title']}」をキャンセル",
+            human_summary=f"{current['start_at']}の予定をキャンセルします。",
+            structured_payload=material_payload(current),
+        )
+
     def search(args: BaseModel, _context: ToolContext) -> ToolResult:
         parsed = SearchArgs.model_validate(args)
         events = store.search(
@@ -114,6 +172,18 @@ def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
             evidence={"event": event.model_dump(mode="json"), "cancelled": True},
         )
 
+    async def provider_sync(args: BaseModel, context: ToolContext) -> ToolResult:
+        if sync_service is None:
+            return ToolResult(
+                status="denied", evidence={"reason_code": "CALENDAR_PROVIDER_NOT_CONFIGURED"}
+            )
+        parsed = ProviderSyncArgs.model_validate(args)
+        return ToolResult(
+            status="ok",
+            reversible=True,
+            evidence=await sync_service.sync(parsed.provider, task_id=context.task_id),
+        )
+
     return [
         ToolDefinition(
             name="calendar.search",
@@ -139,6 +209,7 @@ def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
             risk_level=RiskLevel.R1,
             mutation=True,
             required_permissions=("calendar.write",),
+            approval_material_builder=create_material,
         ),
         ToolDefinition(
             name="calendar.update",
@@ -148,6 +219,7 @@ def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
             risk_level=RiskLevel.R1,
             mutation=True,
             required_permissions=("calendar.write",),
+            approval_material_builder=update_material,
         ),
         ToolDefinition(
             name="calendar.cancel",
@@ -157,5 +229,18 @@ def calendar_tools(store: CalendarStore) -> list[ToolDefinition[Any]]:
             risk_level=RiskLevel.R2,
             mutation=True,
             required_permissions=("calendar.write",),
+            approval_material_builder=cancel_material,
+        ),
+        ToolDefinition(
+            name="calendar.provider_sync",
+            description=(
+                "Synchronize a configured provider through the privileged connector; "
+                "local pending changes are never overwritten on conflict."
+            ),
+            args_model=ProviderSyncArgs,
+            handler=provider_sync,
+            risk_level=RiskLevel.R1,
+            mutation=True,
+            required_permissions=("calendar.read",),
         ),
     ]

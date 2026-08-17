@@ -13,44 +13,60 @@ Phase別の対応範囲は [docs/implementation-status.md](docs/implementation-s
 - SQLiteによるTask、Plan、Event、Message、Action、Audit、Scheduler Jobの永続化
 - `RECEIVED` から `COMPLETED` までの状態遷移とPause/Resume/Cancel
 - 再起動時に処理途中のTaskを自動実行せず、安全な `PAUSED` 状態へ復旧
+- Plan/Stepの入力・出力・Evidence・attempt・model・prompt versionを永続化し、完了stepを再実行しないResume
+- in-flight mutationの再起動復旧を`SUBMITTED_UNKNOWN`に固定し、自動再送を禁止
 - 時刻、タイマー、アラーム、状態確認、停止をQwenなしのTier 0で処理
 - その他の依頼をOpenAI互換のローカルQwen endpointへ送るDeep Path
 - Mutation ToolのIdempotency Key、Dry-run、型検証、Policy判定、監査
 - stepごとに固定したTool/permission/riskと、Tool Brokerでの`required_permissions`強制
+- LLM Capability Proposalをユーザー原文由来の決定論的validatorで縮小・拒否する二段Planner
+- opaque IDを実体へ展開するApproval Materialと実行直前hash再検証
 - 外部Web・メール・ファイル内容から後続stepの権限を増やせないCapability Plan
 - 永続Timer/AlarmとVoice/PWAへのclaim・ack型通知配信
 - Global Pause、Finance Lock、Browser Lock、Secret Lock
 - LINE webhookの署名検証、Primary User限定、Webhook再送の重複排除
 - Secret系の監査ログ自動redaction
 - Voice/LINE/Web会話の共通Raw Event化と90日Retention
-- 日本語substring対応SQLite FTSによるPersonal Search
+- FTS + optional local Embedding + Recency/Importance/Confidence/EntityのHybrid Search
 - Evidence付きLong-term Memory、Preference、Entity、Decision Log
 - 「覚えて」「忘れて」「メモリ検索」のTier 0処理と必要量だけのQwen context注入
 - Safari Activity Batch受信、Sensitive DomainのOrigin-only化、Domain禁止設定
 - AES-GCM offline queueを持つSafari Web Extension source
 - Windows Playwright Worker、6用途別Persistent Chrome Profile、通常表示Chrome
 - 型付きBrowser Primitive、DOM参照ID、DOM→mask済みScreenshot→座標操作の強制順序
+- stale ref拒否、locator retry、DOM安定化、page fingerprint、popup、upload/download/submit検証
 - finance allowlist、隔離Download、Mutation Idempotency、Human Takeover lock
 - trackedなQwen Chat Completions clientとstep-scoped tool-call loop（最大12 turn）
 - Windows user-scoped DPAPI Secret Store、Origin/Action binding、TOTP direct-fill
 - `auth.ensure_authenticated`、既存Session優先、曖昧Account停止、OTP Task binding
 - 1回限りの承認Grant、WebAuthn UVによるR4/R5承認、PWA承認/OTP/Secret履歴
 - LINE/Slack/Gmailを共通形式へ正規化し、検索・thread取得・下書き・送信を分離
+- Gmail/Google Calendar OAuth・自動refresh、label、添付隔離download、送信照合
+- local/Google Calendar provider、同期mapping/version、競合時fail-closed
+- Manual/Google/Gmail/LINE/Memory由来Contactと曖昧宛先の送信停止
 - Slack/Gmail tokenをCoreやLLMへ渡さないPrivileged Connector Worker
 - ローカルCalendarの検索・空き時間・作成・更新・取消と永続Scheduler
 - Agent実行Taskとは別tableのPersonalTodoと構造化Diary、Asia/Tokyoの深夜business date
 - Economic Action、確定見積、Budget、Payee、Sandbox送金、照合、`SUBMITTED_UNKNOWN`
 - allowlist root内だけのFile検索・読取・コピー・移動・改名・回収可能な削除
+- PDF/DOCX/XLSX/PPTX/HTML/Image/ZIPの非実行解析、PDF table、Vision fallback
+- allowlistされたProcess/App/Job/Clipboard/Desktop/固定CommandだけのComputer Automation
+- allowlist repository内での永続Codex job、test実行、cancel、完了通知
 - Home Assistantの状態取得・照明・温度・Scene（lock/alarmはfail-closed）
 - 既定OFFのProactive検出、quiet hours、通知頻度、根拠付き継続follow-up
+- Todo/Calendar/Gmail/経済Intent/予約を直接読むevent-driven Attention rule
+- Candidate→Final Quote→Browser submit→email/receipt照合のCommerce workflow
 - Daily Summary、Memory decay、根拠付きPreference候補、実行無効のWorkflow候補
-- System Health、モデル/tool latency、監査検索、暗号化backup、秘密を含まないexport、範囲削除
+- 成功率・待ち時間・scheduler遅延・通知・provider同期を含むMetrics
+- 自動暗号化backup、復号/SQLite検証、世代保持、秘密を含まないexport、範囲削除
+- `personal-agent doctor`によるCore/Model/DB/Worker/Google/LINE/Tailscale/Passkey/HA/Voice診断
 - 17カテゴリのdry-run Benchmark HarnessとPWA管理画面
 
 外部Mutationは、stepでToolが公開され、必要permissionがgrantされ、Worker Token、Safety Lock、
 Risk Policy、承認、Evidenceを通過した場合だけ
-実行します。購入・予約は型付きBrowser操作とEconomic Intentで実現できる構成ですが、
-実サイトごとの専用Adapterは同梱していません。実銀行への送金は意図的に未接続で、
+実行します。購入・予約は型付きBrowser操作、Economic Intent、Commerce reconciliationで実行でき、
+`SiteAdapter` frameworkとlocal E2E用exampleを同梱します。大量の実サイト専用Adapterはありません。
+実銀行への送金は意図的に未接続で、
 Money機能はSandboxだけです。実行していないDeep Pathは
 `external_action_performed=false`、送信結果が不明な場合は
 `external_action_may_have_occurred=true` をEvidenceへ記録します。
@@ -64,14 +80,17 @@ Voice text / LINE webhook / Web PWA
              AgentService
         ┌─────────┴─────────┐
         ▼                   ▼
-  Tier 0 Router       Local Qwen client
+  Tier 0 Router       Local Model Router
+                       ├─ fast
+                       ├─ strong Qwen
+                       └─ vision
         │                   │
         └─────────┬─────────┘
                   ▼
  Step Capability → Policy → Tool Broker
                   │
                   ▼
- SQLite Task / Action / Audit / FTS Memory / Calendar / Economic Intent
+ SQLite Task / Durable Step / Audit / Hybrid Memory / Calendar / Commerce
                   │
                   ▼ authenticated loopback
  Windows Playwright Worker → Chrome Profiles / DPAPI Secret Store / Slack / Gmail
@@ -143,7 +162,7 @@ CLI値は非表示promptから2回入力され、Windowsの現在ユーザーに
 外部Secret Manager等から `PERSONAL_AGENT_SECRET_MASTER_KEY` を注入してFernet backendを
 使えます。keyをrepositoryや `.env` へ保存しないでください。
 
-Slack/Gmail connectorもtokenをWindows Secret Storeへ対話登録します。
+Slack connectorとGoogle OAuth client credentialもWindows Secret Storeへ対話登録します。
 
 ```powershell
 personal-agent-secret put secret://connector/slack/main `
@@ -152,10 +171,16 @@ personal-agent-secret put secret://connector/slack/main `
   --origin https://slack.com `
   --action connector_request
 
-personal-agent-secret put secret://connector/gmail/main `
+personal-agent-secret put secret://google/client-id `
   --kind api_token `
-  --account-label main `
-  --origin https://gmail.googleapis.com `
+  --account-label google-client `
+  --origin https://oauth2.googleapis.com `
+  --action connector_request
+
+personal-agent-secret put secret://google/client-secret `
+  --kind api_token `
+  --account-label google-client `
+  --origin https://oauth2.googleapis.com `
   --action connector_request
 ```
 
@@ -163,12 +188,16 @@ Core側には値ではなく参照だけを設定します。
 
 ```text
 PERSONAL_AGENT_SLACK_CREDENTIAL_ID=secret://connector/slack/main
-PERSONAL_AGENT_GMAIL_CREDENTIAL_ID=secret://connector/gmail/main
+PERSONAL_AGENT_GOOGLE_CLIENT_ID_CREDENTIAL_ID=secret://google/client-id
+PERSONAL_AGENT_GOOGLE_CLIENT_SECRET_CREDENTIAL_ID=secret://google/client-secret
+PERSONAL_AGENT_GOOGLE_REFRESH_CREDENTIAL_ID=secret://google/refresh/main
 ```
 
-Slackは `chat:write` と `search:read` を持つtoken、Gmailはmessagesのread/send scopeを持つ
-access tokenが必要です。OAuth refresh flowは同梱していないため、期限切れtokenはSecret CLIで
-再登録してください。Slack送信先は曖昧な表示名ではなくchannel/conversation ID、Gmail送信先は
+Slackは `chat:write` と `search:read` を持つtokenを使用します。GoogleはPWAのOAuth開始画面から
+Gmail read/modify/send、Calendar、Contacts readonly scopeを承認し、refresh tokenをCore DBではなく
+Secret Workerへ保存します。
+refreshとaccess token利用もWorker内だけで行い、Core/LLM/responseへ返しません。
+Slack送信先は曖昧な表示名ではなくchannel/conversation ID、Gmail送信先は
 正確なメールアドレスを使用します。
 
 PWAでSlack/Gmail connectorを失効すると、Core側のpermissionを永続的にOFFにし、到達可能なら
@@ -437,6 +466,8 @@ curl -s http://127.0.0.1:8787/api/channels/voice/input \
 全チャネルの会話は共通Raw Eventへ正規化されます。OTP、Password、Bearer Token、カード番号は
 永続化前に除去されます。Long-term Memoryは明示的な「覚えて」またはWeb UI操作で作成し、
 会話全文を無条件に長期Memory化しません。
+検索はFTSを常に残し、ローカルEmbedding endpointを設定した場合だけsemantic scoreを加えます。
+同じEntityの新旧情報は上書きせず、`supersedes` relation、source evidence、時刻を保持します。
 
 Safari Extension sourceは `activity-extension/` にあります。macOS/XcodeでiOS app containerへ
 変換する手順は [activity-extension/README.md](activity-extension/README.md) を参照してください。
@@ -453,7 +484,8 @@ PERSONAL_AGENT_ACTIVITY_TOKEN=十分に長いランダム値
 
 ## Files・Home Assistant・Economic Sandbox
 
-File Toolは `PERSONAL_AGENT_FILES_ROOTS` で明示したrootの内側だけを扱います。symlink経由の
+File Toolは `PERSONAL_AGENT_FILES_ROOTS` で明示したrootの内側だけを扱います。PDF、Office、HTML、
+画像、ZIPをmacro/script実行なしで解析します。symlink経由の
 root逸脱、SSH鍵・credential・private keyの読取、既存ファイルへの暗黙上書きを拒否します。
 削除は `PERSONAL_AGENT_FILES_TRASH_ROOT` への移動です。ファイル本文は常にuntrusted dataとして
 扱い、そこに書かれた指示をAgent命令へ昇格しません。
@@ -470,8 +502,9 @@ entity IDは完全一致が必須です。低リスクdomainの照明、一般sw
 内容を確認して `SAFE_SCENES` へ明示したIDだけをR2承認後に実行します。lock/alarmや任意script/
 automation domainはstrong-auth adapterがない状態では常に拒否します。
 
-購入・予約・送金の安全性はEconomic Intent、確定見積、上限、単位、通貨、Payee、Idempotency、
-照合状態で管理します。初期残高・Budget・登録Payeeは確認付きCLIで設定します。
+購入・予約はCandidate、選択、確定見積、Browser Approval Material、submit、confirmation ID、確認メール、
+receiptの照合状態で管理します。Browserと第二のdurable evidenceが一致しない限り成功扱いにせず、
+再送もしません。送金はSandbox Economic Intent、上限、Payee、Idempotencyで管理します。
 
 ```bash
 personal-agent-sandbox set-balance 50000 --currency JPY
@@ -487,7 +520,8 @@ Sandbox DBだけを変更し、`route-ref` の値そのものを読み取らず�
 ## Proactive・保守・データ管理
 
 Proactive Agentは既定OFFです。PWAのOps画面で明示的に有効化し、カテゴリ、quiet hours、
-最低通知間隔を設定できます。返信待ち、返金、配送、期限、subscription候補を根拠ID付きで検出し、
+最低通知間隔を設定できます。Todo期限、予定間の移動不足、要返信label、返金期限、予約メールと予定の
+不一致、配送、subscription候補を根拠ID付きで検出し、
 勝手に外部操作せず、解決まで最大30日の日次follow-upを管理します。
 
 DB quotaの80%到達時は永続通知を作り、Raw Eventは保持期間に従ってpurgeします。秘密値を含まない
@@ -496,13 +530,20 @@ restore中はCore/Workerを停止してWALがない状態にしてください�
 WindowsではDPAPIを使用します。非Windowsでは `.[auth]` を導入し、外部から
 `PERSONAL_AGENT_SECRET_MASTER_KEY` を渡した環境だけで利用できます。
 
+`PERSONAL_AGENT_BACKUP_ROOT`を設定するとCore DBを定期snapshotし、暗号化後に実際に復号して
+`PRAGMA integrity_check`を通し、日数と件数の両方で世代管理します。Secret Workerのciphertextは
+Windows DPAPIの同一Windows user profileへbindingされています。DB backupだけを別PC/別userへ移しても
+復号できないため、Windows system image/回復手段とprovider側credential再発行手順も別途保管してください。
+
 ```bash
 personal-agent-backup create /safe/offline/core.pa-backup --database core
 personal-agent-backup inspect /safe/offline/core.pa-backup
+personal-agent-backup verify /safe/offline/core.pa-backup
 personal-agent-backup restore /safe/offline/core.pa-backup \
   --database core --replace --confirm-replace RESTORE
 
 personal-agent-benchmark --trials 3
+personal-agent doctor
 ```
 
 Benchmarkは外部Mutationを実行しないdry-runです。未設定のoptional connector/hardwareはskip、
@@ -530,6 +571,11 @@ POST /api/activity/batch
 GET  /api/activity/status
 PUT  /api/activity/status
 GET  /api/tasks
+GET  /api/today
+GET/POST/PATCH/DELETE /api/todos
+GET/POST /api/diary
+GET  /api/inbox
+GET  /api/files/recent
 GET  /api/tasks/{task_id}
 POST /api/tasks/{task_id}/pause
 POST /api/tasks/{task_id}/resume
@@ -540,6 +586,7 @@ POST /api/communication/{source}/sync
 GET  /api/calendar/events
 GET  /api/calendar/free-busy
 POST /api/calendar/events
+POST /api/calendar/sync
 GET  /api/economic/intents
 GET  /api/economic/transactions
 GET  /api/economic/budgets
@@ -577,13 +624,15 @@ R4/R5のAction承認にはsessionだけでなく、そのActionへbindingされ�
 ```bash
 .venv/bin/ruff check .
 .venv/bin/pytest -q
+.venv/bin/pytest -q -m e2e
+.venv/bin/python -m compileall -q src
 ```
 
 テストは実モデルや外部サービスへ送信せず、Tier 0、状態遷移、再起動復旧、Cross-channel resume、
 Kill Switch、Dry-run、Idempotency、redaction、LINE署名、FTS、Retention、Evidence、Activity privacy、
 Browser Worker認証、DOM参照、実Chromium操作、SSRF防止、finance allowlist、Takeover lock、
-Secret暗号化境界、Origin binding、TOTP、OTP期限、承認single-use、Slack/Gmail正規化、Calendar、
-Economic Sandbox、Files/Home境界、Proactive、学習候補、Health、export/delete、暗号化backup、
+Secret暗号化境界、Origin binding、TOTP、OTP期限、Approval Material改変、Slack/Gmail正規化、Calendar、
+Commerce照合、Economic Sandbox、Files/Home境界、Proactive、Hybrid Memory、Health、暗号化backup、
 Benchmark、WebAuthn challenge binding・有効期限・single-use・passkey sessionを検証します。
 
 ## 安全上の既定値
@@ -601,7 +650,7 @@ Benchmark、WebAuthn challenge binding・有効期限・single-use・passkey ses
 - password/OTP/card fieldは通常の `browser.type` から入力不可
 - Screenshotはpassword/OTP/payment fieldをmask
 - Human Takeover中とtimeout後はAgent Mutationをlock
-- transient Taskは再起動後に勝手に再実行せずPause
+- read-only transient stepは再起動後にPendingへ戻し、in-flight mutationは`SUBMITTED_UNKNOWN`で停止
 - LINEは登録済みPrimary Userのみ
 - Admin Token未設定時はR5相当の管理操作を拒否
 - Proactive、Preference学習、Workflow学習は自動実行しない
@@ -612,24 +661,23 @@ Benchmark、WebAuthn challenge binding・有効期限・single-use・passkey ses
 
 - WebAuthnはexact HTTPS Origin/RP IDが必要です。Tailscale ACL/Grantを狭くしない限り、同じ
   tailnet内の他端末から一般APIへ到達できるため、iPhone設定手順のアクセス制限が運用上必須です。
-- Calendarはローカル正規化storeです。Google Calendar等とのprovider同期は未実装です。
-- Gmailはaccess tokenの自動refreshを行いません。Slack/Gmail tokenの取得とrotationは手動です。
-- Slack/Gmail attachment本文はconnectorから自動取得しません。必要な取得はBrowserの隔離Downloadを
-  別Actionとして実行します。
-- Shopping/Reservationは汎用Browser + Economic Intentで実行する基盤です。サイト固有Adapter、
-  PDF/OCR、確認メールとの自動突合ルールはありません。
+- Google Calendar/Gmailは実装済みですが、本人credentialを使う実provider E2Eは未検証です。
+- Google ContactsはOAuth scopeとsource対応の統合storeまでです。People APIからの取得・同期は未実装です。
+- Shopping/Reservationの汎用flowとAdapter interfaceはありますが、各実サイトのDOM変更に追従する
+  専用Adapterはexample以外ありません。CAPTCHA/3DS/PasskeyはHuman Takeoverが必要です。
 - MoneyはSandboxのみです。銀行Adapter、実カード、実送金を有効化するコードはありません。
 - iPhoneはPWA/LINE/Tailscale、Face ID passkey、手動OTP入力を利用します。任意アプリの自動操作、
   遠隔画面操作、Web Pushによるバックグラウンド通知はしません。通知はLINEを併用してください。
-- File Toolはテキスト読取と安全なファイル操作に限定し、形式変換・PDF OCR・自動taggingはしません。
-- PC操作は状態取得・永続通知・Windows workstation lockに限定し、任意shellや任意app起動はしません。
+- scanned PDF/imageは設定済みlocal Visionへfallbackします。専用OCR modelは同梱しません。
+- PC/Coding操作はoperator allowlist内だけです。任意shell、sudo、credential dump、任意root操作はありません。
 - Wake Word/STT/TTS、Qwen、Chrome、Home Assistant、LINE、Slack、Gmailは対応する実機・model・
   credentialを用意して初めてend-to-endで動作します。
 
 ## CIとローカル検証
 
-GitHub ActionsはPython 3.11/3.12で`pip install -e '.[dev]'`、`ruff check .`、`pytest`、
-`python -m compileall -q src`を実行します。Windows/DPAPI/Windows Hello/実ブラウザはLinux CIで
+GitHub Actionsはlocked dependencyでPython 3.11/3.12のRuff/pytest/compileall/Local E2Eを実行し、
+別jobでpip-audit、Bandit、detect-secretsを実行します。Dependabotはpip/Actionsを週次確認します。
+Windows/DPAPI/Windows Hello/実providerはLinux CIで
 実機E2Eせず、unit testではfakeまたはmockを使います。ローカル仮想環境`.venv/`、`.env`、SQLite DB、
 GGUF modelはGit管理対象外です。
 

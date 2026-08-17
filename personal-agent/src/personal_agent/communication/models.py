@@ -36,6 +36,7 @@ class NormalizedMessageCreate(BaseModel):
     attachments: list[AttachmentReference] = Field(default_factory=list, max_length=100)
     reply_to: str | None = Field(default=None, max_length=512)
     permissions: list[str] = Field(default_factory=list, max_length=100)
+    labels: list[str] = Field(default_factory=list, max_length=200)
     source_reference: str = Field(min_length=1, max_length=2_000)
 
 
@@ -48,6 +49,7 @@ class DraftCreate(BaseModel):
     text: str = Field(min_length=1, max_length=100_000)
     thread_id: str | None = Field(default=None, max_length=512)
     reply_to: str | None = Field(default=None, max_length=512)
+    attachments: list[AttachmentReference] = Field(default_factory=list, max_length=20)
 
 
 class CommunicationSearchHit(BaseModel):
@@ -58,7 +60,10 @@ class CommunicationSearchHit(BaseModel):
     sender_entity_id: str | None
     timestamp: str
     text: str
+    attachments: list[AttachmentReference] = Field(default_factory=list)
+    permissions: list[str] = Field(default_factory=list)
     source_reference: str
+    labels: list[str] = Field(default_factory=list)
     trust_level: str = "untrusted"
 
 
@@ -72,6 +77,7 @@ class DraftRecord(BaseModel):
     text: str
     thread_id: str | None
     reply_to: str | None
+    attachments: list[AttachmentReference] = Field(default_factory=list)
     state: str
     external_message_id: str | None = None
     evidence: dict[str, Any] = Field(default_factory=dict)

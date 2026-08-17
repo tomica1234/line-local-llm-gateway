@@ -96,6 +96,7 @@ class ToolResult(BaseModel):
         "dry_run",
         "waiting_auth",
         "waiting_user",
+        "waiting_external",
         "submitted_unknown",
     ]
     external_id: str | None = None

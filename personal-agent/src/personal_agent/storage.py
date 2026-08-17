@@ -6,17 +6,56 @@ import os
 import sqlite3
 import threading
 import uuid
+from calendar import monthrange
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from .approval import ApprovalMaterial, generic_approval_material
+from .migrations import Migration, add_column, apply_migrations
 from .types import Channel, RiskLevel, Route, TaskEventRecord, TaskRecord, TaskState
 
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+
+def next_recurrence(run_at: datetime, recurrence: dict[str, Any]) -> datetime | None:
+    interval = max(1, int(recurrence.get("interval", 1)))
+    frequency = str(recurrence.get("frequency", "")).casefold()
+    if frequency == "daily":
+        return run_at + timedelta(days=interval)
+    if frequency == "weekly":
+        return run_at + timedelta(weeks=interval)
+    if frequency == "weekdays":
+        candidate = run_at
+        remaining = interval
+        while remaining:
+            candidate += timedelta(days=1)
+            if candidate.weekday() < 5:
+                remaining -= 1
+        return candidate
+    if frequency == "monthly":
+        month_index = run_at.year * 12 + run_at.month - 1 + interval
+        year, month_zero = divmod(month_index, 12)
+        month = month_zero + 1
+        day = min(run_at.day, monthrange(year, month)[1])
+        return run_at.replace(year=year, month=month, day=day)
+    if frequency == "custom":
+        components: dict[str, str] = {}
+        for item in str(recurrence.get("rrule") or "").removeprefix("RRULE:").split(";"):
+            if "=" in item:
+                key, value = item.split("=", 1)
+                components[key.upper()] = value.upper()
+        mapped = components.get("FREQ", "").casefold()
+        custom = {**recurrence, "frequency": mapped}
+        if components.get("INTERVAL", "").isdigit():
+            custom["interval"] = int(components["INTERVAL"])
+        if mapped and mapped != "custom":
+            return next_recurrence(run_at, custom)
+    return None
 
 
 SCHEMA = """
@@ -81,6 +120,8 @@ CREATE TABLE IF NOT EXISTS actions (
     risk_level TEXT NOT NULL,
     reason TEXT NOT NULL,
     input_json TEXT NOT NULL,
+    step_id TEXT,
+    mutation INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL,
     result_json TEXT,
     created_at TEXT NOT NULL,
@@ -94,11 +135,15 @@ CREATE TABLE IF NOT EXISTS scheduled_jobs (
     kind TEXT NOT NULL,
     run_at TEXT NOT NULL,
     payload_json TEXT NOT NULL,
+    resource_type TEXT,
+    resource_id TEXT,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_due ON scheduled_jobs(status, run_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_resource
+ON scheduled_jobs(resource_type, resource_id, status);
 
 CREATE TABLE IF NOT EXISTS notifications (
     notification_id TEXT PRIMARY KEY,
@@ -156,7 +201,10 @@ CREATE TABLE IF NOT EXISTS approvals (
     task_id TEXT NOT NULL REFERENCES tasks(task_id) ON DELETE CASCADE,
     tool_name TEXT NOT NULL,
     arguments_hash TEXT NOT NULL,
+    request_hash TEXT NOT NULL DEFAULT '',
     input_summary_json TEXT NOT NULL,
+    material_json TEXT NOT NULL DEFAULT '{}',
+    material_hash TEXT NOT NULL DEFAULT '',
     risk_level TEXT NOT NULL,
     reason TEXT NOT NULL,
     state TEXT NOT NULL,
@@ -164,6 +212,7 @@ CREATE TABLE IF NOT EXISTS approvals (
     decision_method TEXT,
     decided_at TEXT,
     consumed_at TEXT,
+    reason_code TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(task_id, tool_name, arguments_hash)
@@ -224,6 +273,28 @@ CREATE TABLE IF NOT EXISTS settings (
 """
 
 
+def _core_v2(connection: sqlite3.Connection) -> None:
+    add_column(connection, "actions", "step_id TEXT")
+    add_column(connection, "actions", "mutation INTEGER NOT NULL DEFAULT 0")
+    add_column(connection, "scheduled_jobs", "resource_type TEXT")
+    add_column(connection, "scheduled_jobs", "resource_id TEXT")
+    add_column(connection, "approvals", "request_hash TEXT NOT NULL DEFAULT ''")
+    add_column(connection, "approvals", "material_json TEXT NOT NULL DEFAULT '{}'")
+    add_column(connection, "approvals", "material_hash TEXT NOT NULL DEFAULT ''")
+    add_column(connection, "approvals", "reason_code TEXT")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_resource "
+        "ON scheduled_jobs(resource_type, resource_id, status)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_approvals_request "
+        "ON approvals(task_id, tool_name, request_hash, created_at DESC)"
+    )
+
+
+CORE_MIGRATIONS = (Migration(2, "approval-material-and-durable-actions", _core_v2),)
+
+
 TRANSIENT_STATES = (
     TaskState.RECEIVED,
     TaskState.UNDERSTANDING,
@@ -269,6 +340,7 @@ class Storage:
     def initialize(self) -> None:
         with self._lock, self._connection() as connection:
             connection.executescript(SCHEMA)
+            apply_migrations(connection, component="core", migrations=CORE_MIGRATIONS)
             notification_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(notifications)").fetchall()
@@ -497,6 +569,8 @@ class Storage:
         risk_level: RiskLevel,
         reason: str,
         input_data: dict[str, Any],
+        step_id: str | None = None,
+        mutation: bool = False,
     ) -> tuple[str, dict[str, Any] | None]:
         now = utc_now()
         action_id = str(uuid.uuid4())
@@ -514,8 +588,8 @@ class Storage:
                 return existing["action_id"], result
             connection.execute(
                 "INSERT INTO actions(action_id, task_id, tool_name, idempotency_key, dry_run, "
-                "risk_level, reason, input_json, status, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)",
+                "risk_level, reason, input_json, step_id, mutation, status, created_at, "
+                "updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'started', ?, ?)",
                 (
                     action_id,
                     task_id,
@@ -525,6 +599,8 @@ class Storage:
                     risk_level.value,
                     reason,
                     json.dumps(input_data),
+                    step_id,
+                    int(mutation),
                     now,
                     now,
                 ),
@@ -539,15 +615,33 @@ class Storage:
             )
 
     def create_scheduled_job(
-        self, *, task_id: str, kind: str, run_at: str, payload: dict[str, Any]
+        self,
+        *,
+        task_id: str,
+        kind: str,
+        run_at: str,
+        payload: dict[str, Any],
+        resource_type: str | None = None,
+        resource_id: str | None = None,
     ) -> str:
         job_id = str(uuid.uuid4())
         now = utc_now()
         with self._lock, self._connection() as connection:
             connection.execute(
-                "INSERT INTO scheduled_jobs(job_id, task_id, kind, run_at, payload_json, status, "
-                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?)",
-                (job_id, task_id, kind, run_at, json.dumps(payload), now, now),
+                "INSERT INTO scheduled_jobs(job_id, task_id, kind, run_at, payload_json, "
+                "resource_type, resource_id, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)",
+                (
+                    job_id,
+                    task_id,
+                    kind,
+                    run_at,
+                    json.dumps(payload),
+                    resource_type,
+                    resource_id,
+                    now,
+                    now,
+                ),
             )
         return job_id
 
@@ -571,6 +665,15 @@ class Storage:
             )
         if cursor.rowcount != 1:
             raise KeyError(job_id)
+
+    def cancel_resource_jobs(self, *, resource_type: str, resource_id: str) -> int:
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE scheduled_jobs SET status='cancelled', updated_at=? "
+                "WHERE resource_type=? AND resource_id=? AND status='scheduled'",
+                (utc_now(), resource_type, resource_id),
+            )
+            return int(cursor.rowcount)
 
     def materialize_due_notifications(self) -> int:
         now = datetime.now(UTC)
@@ -624,18 +727,9 @@ class Storage:
                 )
                 recurrence = payload.get("recurrence")
                 if isinstance(recurrence, dict):
-                    interval = int(recurrence.get("interval", 1))
-                    frequency = recurrence.get("frequency")
-                    delta = (
-                        timedelta(days=interval)
-                        if frequency == "daily"
-                        else timedelta(weeks=interval)
-                        if frequency == "weekly"
-                        else None
-                    )
                     count = recurrence.get("count")
                     next_count = int(count) - 1 if count is not None else None
-                    next_at = run_at + delta if delta else None
+                    next_at = next_recurrence(run_at, recurrence)
                     until = recurrence.get("until")
                     within_until = not until or (
                         next_at is not None and next_at <= datetime.fromisoformat(until)
@@ -654,14 +748,17 @@ class Storage:
                         next_job_id = str(uuid.uuid4())
                         connection.execute(
                             "INSERT INTO scheduled_jobs "
-                            "(job_id, task_id, kind, run_at, payload_json, status, "
-                            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'scheduled', ?, ?)",
+                            "(job_id, task_id, kind, run_at, payload_json, resource_type, "
+                            "resource_id, status, created_at, updated_at) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, 'scheduled', ?, ?)",
                             (
                                 next_job_id,
                                 row["task_id"],
                                 row["kind"],
                                 next_at.isoformat(),
                                 json.dumps(next_payload),
+                                row["resource_type"],
+                                row["resource_id"],
                                 timestamp,
                                 timestamp,
                             ),
@@ -689,9 +786,7 @@ class Storage:
                     (str(uuid.uuid4()), row["notification_id"], provider, target, now, now),
                 )
 
-    def claim_notification_delivery(
-        self, *, provider: str, target: str
-    ) -> dict[str, Any] | None:
+    def claim_notification_delivery(self, *, provider: str, target: str) -> dict[str, Any] | None:
         self.materialize_due_notifications()
         now = datetime.now(UTC)
         now_text = now.isoformat(timespec="milliseconds")
@@ -846,6 +941,14 @@ class Storage:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @classmethod
+    def approval_binding_hash(
+        cls, arguments: dict[str, Any], material_hash: str
+    ) -> tuple[str, str]:
+        request_hash = cls.arguments_hash(arguments)
+        binding = hashlib.sha256(f"{request_hash}:{material_hash}".encode()).hexdigest()
+        return request_hash, binding
+
     def request_approval(
         self,
         *,
@@ -855,22 +958,27 @@ class Storage:
         input_summary: dict[str, Any],
         risk_level: RiskLevel,
         reason: str,
+        material: ApprovalMaterial | None = None,
     ) -> dict[str, Any]:
         approval_id = str(uuid.uuid4())
-        digest = self.arguments_hash(arguments)
+        material = material or generic_approval_material(tool_name, input_summary)
+        request_hash, digest = self.approval_binding_hash(arguments, material.material_hash)
         now = utc_now()
         with self._lock, self._connection() as connection:
             connection.execute(
                 "INSERT OR IGNORE INTO approvals "
-                "(approval_id, task_id, tool_name, arguments_hash, input_summary_json, "
-                "risk_level, reason, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "(approval_id, task_id, tool_name, arguments_hash, request_hash, "
+                "input_summary_json, material_json, material_hash, risk_level, reason, state, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
                 (
                     approval_id,
                     task_id,
                     tool_name,
                     digest,
+                    request_hash,
                     json.dumps(input_summary, ensure_ascii=False),
+                    material.model_dump_json(),
+                    material.material_hash,
                     risk_level.value,
                     reason,
                     now,
@@ -885,9 +993,15 @@ class Storage:
         return self._approval_from_row(row)
 
     def approval_for_action(
-        self, *, task_id: str, tool_name: str, arguments: dict[str, Any]
+        self,
+        *,
+        task_id: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        material: ApprovalMaterial | None = None,
     ) -> dict[str, Any] | None:
-        digest = self.arguments_hash(arguments)
+        material = material or generic_approval_material(tool_name, arguments)
+        _, digest = self.approval_binding_hash(arguments, material.material_hash)
         with self._connection() as connection:
             row = connection.execute(
                 "SELECT * FROM approvals WHERE task_id = ? AND tool_name = ? "
@@ -895,6 +1009,28 @@ class Storage:
                 (task_id, tool_name, digest),
             ).fetchone()
         return self._approval_from_row(row) if row else None
+
+    def latest_approval_for_request(
+        self, *, task_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        request_hash = self.arguments_hash(arguments)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM approvals WHERE task_id=? AND tool_name=? AND request_hash=? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (task_id, tool_name, request_hash),
+            ).fetchone()
+        return self._approval_from_row(row) if row else None
+
+    def invalidate_approval(self, approval_id: str, *, reason_code: str) -> bool:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE approvals SET state='denied', reason_code=?, updated_at=? "
+                "WHERE approval_id=? AND state IN ('pending','approved')",
+                (reason_code, now, approval_id),
+            )
+            return cursor.rowcount == 1
 
     def get_approval(self, approval_id: str) -> dict[str, Any]:
         with self._connection() as connection:
@@ -942,14 +1078,23 @@ class Storage:
             ).fetchone()
         return self._approval_from_row(result)
 
-    def consume_approval(self, approval_id: str) -> bool:
+    def consume_approval(
+        self, approval_id: str, *, expected_material_hash: str | None = None
+    ) -> bool:
         now = utc_now()
         with self._lock, self._connection() as connection:
-            cursor = connection.execute(
-                "UPDATE approvals SET state = 'consumed', consumed_at = ?, updated_at = ? "
-                "WHERE approval_id = ? AND state = 'approved'",
-                (now, now, approval_id),
-            )
+            if expected_material_hash is None:
+                cursor = connection.execute(
+                    "UPDATE approvals SET state='consumed', consumed_at=?, updated_at=? "
+                    "WHERE approval_id=? AND state='approved'",
+                    (now, now, approval_id),
+                )
+            else:
+                cursor = connection.execute(
+                    "UPDATE approvals SET state='consumed', consumed_at=?, updated_at=? "
+                    "WHERE approval_id=? AND state='approved' AND material_hash=?",
+                    (now, now, approval_id, expected_material_hash),
+                )
             return cursor.rowcount == 1
 
     def list_approvals(self, *, state: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -1058,4 +1203,6 @@ class Storage:
     def _approval_from_row(row: sqlite3.Row) -> dict[str, Any]:
         result = dict(row)
         result["input_summary"] = json.loads(result.pop("input_summary_json"))
+        material_json = result.pop("material_json", "{}")
+        result["material"] = json.loads(material_json) if material_json else {}
         return result

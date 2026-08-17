@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import date as Date
+from datetime import datetime, time, timedelta
+from enum import StrEnum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -48,9 +51,27 @@ class DiarySearchArgs(BaseModel):
     limit: int = Field(default=50, ge=1, le=200)
 
 
+class SnoozePreset(StrEnum):
+    MINUTES_30 = "30_minutes"
+    HOUR_1 = "1_hour"
+    TONIGHT = "tonight"
+    TOMORROW_MORNING = "tomorrow_morning"
+
+
+class TodoSnoozeArgs(TodoIdArgs):
+    until: datetime | None = None
+    preset: SnoozePreset | None = None
+
+    @model_validator(mode="after")
+    def exactly_one_time(self) -> TodoSnoozeArgs:
+        if (self.until is None) == (self.preset is None):
+            raise ValueError("Supply exactly one snooze timestamp or preset")
+        return self
+
+
 def personal_data_tools(store: PersonalDataStore) -> list[ToolDefinition[Any]]:
     def todo_create(args: BaseModel, _context: ToolContext) -> ToolResult:
-        todo = store.create_todo(PersonalTodoCreate.model_validate(args))
+        todo = store.create_todo(PersonalTodoCreate.model_validate(args), task_id=_context.task_id)
         return ToolResult(status="ok", reversible=True, evidence=todo.model_dump(mode="json"))
 
     def todo_list(args: BaseModel, _context: ToolContext) -> ToolResult:
@@ -69,6 +90,29 @@ def personal_data_tools(store: PersonalDataStore) -> list[ToolDefinition[Any]]:
     def todo_update(args: BaseModel, _context: ToolContext) -> ToolResult:
         parsed = TodoUpdateArgs.model_validate(args)
         todo = store.update_todo(parsed.todo_id, parsed.update_value())
+        return ToolResult(status="ok", reversible=True, evidence=todo.model_dump(mode="json"))
+
+    def todo_delete(args: BaseModel, _context: ToolContext) -> ToolResult:
+        parsed = TodoIdArgs.model_validate(args)
+        return ToolResult(status="ok", evidence=store.delete_todo(parsed.todo_id))
+
+    def todo_snooze(args: BaseModel, _context: ToolContext) -> ToolResult:
+        parsed = TodoSnoozeArgs.model_validate(args)
+        zone = ZoneInfo(store.timezone)
+        now = datetime.now(zone)
+        if parsed.until is not None:
+            until = parsed.until
+        elif parsed.preset is SnoozePreset.MINUTES_30:
+            until = now + timedelta(minutes=30)
+        elif parsed.preset is SnoozePreset.HOUR_1:
+            until = now + timedelta(hours=1)
+        elif parsed.preset is SnoozePreset.TONIGHT:
+            until = datetime.combine(now.date(), time(20, 0), tzinfo=zone)
+            if until <= now:
+                until += timedelta(days=1)
+        else:
+            until = datetime.combine(now.date() + timedelta(days=1), time(8, 0), tzinfo=zone)
+        todo = store.snooze_todo(parsed.todo_id, until=until)
         return ToolResult(status="ok", reversible=True, evidence=todo.model_dump(mode="json"))
 
     def diary_create(args: BaseModel, _context: ToolContext) -> ToolResult:
@@ -123,6 +167,24 @@ def personal_data_tools(store: PersonalDataStore) -> list[ToolDefinition[Any]]:
             description="Update explicit fields on one exact PersonalTodo ID.",
             args_model=TodoUpdateArgs,
             handler=todo_update,
+            risk_level=RiskLevel.R1,
+            mutation=True,
+            required_permissions=("todo.write",),
+        ),
+        ToolDefinition(
+            name="todo.delete",
+            description="Delete one exact PersonalTodo and cancel all unfired reminders.",
+            args_model=TodoIdArgs,
+            handler=todo_delete,
+            risk_level=RiskLevel.R1,
+            mutation=True,
+            required_permissions=("todo.write",),
+        ),
+        ToolDefinition(
+            name="todo.snooze",
+            description="Move one Todo reminder to an explicit time or a bounded preset.",
+            args_model=TodoSnoozeArgs,
+            handler=todo_snooze,
             risk_level=RiskLevel.R1,
             mutation=True,
             required_permissions=("todo.write",),

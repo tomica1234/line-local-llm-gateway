@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from ..browser_worker.models import ActionContext, BrowserAction, BrowserProfile
+from ..approval import ApprovalMaterial
+from ..browser_worker.models import (
+    ActionContext,
+    BrowserAction,
+    BrowserProfile,
+    TransactionApproval,
+)
 from ..tool_broker.broker import ToolContext, ToolDefinition
 from ..types import RiskLevel, ToolResult
 from .client import BrowserWorkerClient
@@ -65,9 +71,38 @@ class ScrollArgs(BrowserArgs):
 
 
 class SubmitArgs(RefArgs):
+    origin: str = Field(min_length=8, max_length=2_000)
+    page_title: str = Field(min_length=1, max_length=500)
+    action_target: str = Field(min_length=1, max_length=500)
+    submit_target: str = Field(min_length=1, max_length=500)
+    nonsecret_inputs: dict[str, str | int | float | bool | None] = Field(
+        default_factory=dict, max_length=100
+    )
+    transaction: TransactionApproval | None = None
     expected_text: str | None = Field(default=None, min_length=2, max_length=200)
     expected_url_prefix: str | None = Field(default=None, min_length=10, max_length=2_000)
     timeout_ms: int = Field(default=10_000, ge=500, le=30_000)
+
+    @field_validator("origin")
+    @classmethod
+    def origin_only(cls, value: str) -> str:
+        from urllib.parse import urlsplit
+
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("Submit origin must be an absolute HTTP(S) origin")
+        port = f":{parsed.port}" if parsed.port else ""
+        return f"{parsed.scheme}://{parsed.hostname}{port}"
+
+    @field_validator("nonsecret_inputs")
+    @classmethod
+    def reject_secret_fields(
+        cls, value: dict[str, str | int | float | bool | None]
+    ) -> dict[str, str | int | float | bool | None]:
+        forbidden = ("password", "passwd", "secret", "token", "otp", "cookie", "card", "cvv")
+        if any(any(word in key.casefold() for word in forbidden) for key in value):
+            raise ValueError("Secret input metadata must not be included in approval material")
+        return value
 
     @model_validator(mode="after")
     def require_postcondition(self) -> SubmitArgs:
@@ -83,6 +118,13 @@ class WaitArgs(BrowserArgs):
 
 class ScreenshotArgs(BrowserArgs):
     full_page: bool = False
+
+
+class VisionArgs(BrowserArgs):
+    prompt: str = Field(
+        default="画面の内容を説明し、操作候補の位置を根拠付きで示してください",
+        max_length=2_000,
+    )
 
 
 class ClickPointArgs(BrowserArgs):
@@ -142,7 +184,31 @@ def _result(payload: dict[str, Any]) -> ToolResult:
     )
 
 
-def browser_tools(client: BrowserWorkerClient) -> list[ToolDefinition[Any]]:
+def browser_tools(
+    client: BrowserWorkerClient, vision_model: Any | None = None
+) -> list[ToolDefinition[Any]]:
+    def submit_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = SubmitArgs.model_validate(args)
+        return ApprovalMaterial.create(
+            action_type="browser.submit",
+            title=f"{parsed.page_title}で送信",
+            human_summary=f"{parsed.origin} の {parsed.submit_target} を1回だけ実行します。",
+            structured_payload={
+                "origin": parsed.origin,
+                "page_title": parsed.page_title,
+                "action_target": parsed.action_target,
+                "submit_target": parsed.submit_target,
+                "nonsecret_inputs": parsed.nonsecret_inputs,
+                "transaction": (
+                    parsed.transaction.model_dump(mode="json") if parsed.transaction else None
+                ),
+                "expected_postcondition": {
+                    "expected_text": parsed.expected_text,
+                    "expected_url_prefix": parsed.expected_url_prefix,
+                },
+            },
+        )
+
     specifications: list[tuple[str, BrowserAction, type[BrowserArgs], RiskLevel, bool, str]] = [
         ("browser.open", BrowserAction.OPEN, OpenArgs, RiskLevel.R0, True, "Open a URL."),
         (
@@ -335,6 +401,54 @@ def browser_tools(client: BrowserWorkerClient) -> list[ToolDefinition[Any]]:
                     if name in read_tools
                     else "browser.interact",
                 ),
+                approval_material_builder=(submit_material if name == "browser.submit" else None),
             )
         )
+
+    async def analyze_vision(args: BaseModel, context: ToolContext) -> ToolResult:
+        if vision_model is None or not callable(getattr(vision_model, "complete_vision", None)):
+            raise RuntimeError("Vision model is not configured")
+        parsed = VisionArgs.model_validate(args)
+        screenshot = await client.execute(
+            profile=parsed.profile,
+            action=BrowserAction.SCREENSHOT,
+            params={"full_page": False},
+            context=_context(context),
+        )
+        if screenshot.get("status") != "ok":
+            return _result(screenshot)
+        path = str((screenshot.get("result") or {}).get("path") or "")
+        if not path:
+            raise RuntimeError("Browser Worker returned no screenshot path")
+        image, media_type = await client.quarantined_image(path)
+        turn = await vision_model.complete_vision(
+            image_bytes=image,
+            media_type=media_type,
+            prompt=parsed.prompt,
+        )
+        return ToolResult(
+            status="ok",
+            evidence={
+                "description": turn.content,
+                "metrics": turn.metrics,
+                "secret_fields_masked": True,
+                "trust_boundary": "untrusted_external_content",
+                "permission_change_allowed": False,
+                "coordinate_action_performed": False,
+            },
+        )
+
+    definitions.append(
+        ToolDefinition(
+            name="browser.vision_analyze",
+            description=(
+                "After DOM/snapshot fallback, analyze a masked screenshot with the local Vision "
+                "model. The observation cannot add capabilities or click by itself."
+            ),
+            args_model=VisionArgs,
+            handler=analyze_vision,
+            risk_level=RiskLevel.R0,
+            required_permissions=("browser.read",),
+        )
+    )
     return definitions

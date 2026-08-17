@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import platform
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
+from pathlib import Path
 from typing import Annotated, Any, Protocol
 
 import httpx
@@ -23,12 +25,18 @@ from .connectors import (
     ConnectorSearchRequest,
     ConnectorSendRequest,
     ConnectorWorkerService,
+    GmailAttachmentRequest,
+    GoogleCalendarRequest,
+    GoogleCredentialCheckRequest,
+    GoogleOAuthExchangeRequest,
+    GoogleOAuthStartRequest,
 )
 from .controller import (
     BrowserUnavailable,
     HumanTakeoverActive,
     PlaywrightController,
     SecretInputRequired,
+    StaleBrowserReference,
 )
 from .models import (
     ACTION_PARAMETER_MODELS,
@@ -90,6 +98,12 @@ class BrowserController(Protocol):
     async def close(self) -> None: ...
 
 
+class QuarantinedImageRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    path: str
+
+
 def create_browser_worker_app(
     settings: BrowserWorkerSettings | None = None,
     controller: BrowserController | None = None,
@@ -117,7 +131,9 @@ def create_browser_worker_app(
         return AuthOrchestrator(runtime_controller, secrets_runtime(), store)
 
     def connectors_runtime() -> ConnectorWorkerService:
-        return connector_service or ConnectorWorkerService(secrets_runtime(), store)
+        return connector_service or ConnectorWorkerService(
+            secrets_runtime(), store, quarantine_root=configured.quarantine_root
+        )
 
     async def core_lock_check(
         profile: BrowserProfile, *, require_browser: bool, require_secret: bool
@@ -227,6 +243,24 @@ def create_browser_worker_app(
     async def profiles() -> list[dict[str, Any]]:
         return await runtime_controller.list_profiles()
 
+    @app.post("/v1/quarantine/image", dependencies=protected)
+    async def quarantined_image(request: QuarantinedImageRequest) -> dict[str, Any]:
+        root = configured.quarantine_root.resolve()
+        path = Path(request.path).resolve(strict=True)
+        if not path.is_relative_to(root) or not path.is_file():
+            raise HTTPException(status_code=403, detail="Path is outside the quarantine root")
+        if path.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise HTTPException(status_code=415, detail="Quarantine file is not a supported image")
+        content = path.read_bytes()
+        if len(content) > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Quarantine image exceeds 20 MiB")
+        media_type = "image/png" if path.suffix.casefold() == ".png" else "image/jpeg"
+        return {
+            "media_type": media_type,
+            "content_base64": base64.b64encode(content).decode("ascii"),
+            "secret_fields_masked": True,
+        }
+
     @app.post("/v1/connectors/{provider}/send", dependencies=protected)
     async def connector_send(
         provider: ConnectorProvider, request: ConnectorSendRequest
@@ -244,6 +278,41 @@ def create_browser_worker_app(
         if not allowed:
             raise HTTPException(status_code=423, detail=reason)
         return await connectors_runtime().search(provider, request)
+
+    @app.post("/v1/connectors/google-calendar", dependencies=protected)
+    async def google_calendar(request: GoogleCalendarRequest) -> dict[str, Any]:
+        allowed, reason = await check_connector_locks(BrowserProfile.COMMUNICATION)
+        if not allowed:
+            raise HTTPException(status_code=423, detail=reason)
+        return await connectors_runtime().google_calendar(request)
+
+    @app.post("/v1/connectors/google/status", dependencies=protected)
+    async def google_status(request: GoogleCredentialCheckRequest) -> dict[str, Any]:
+        allowed, reason = await check_connector_locks(BrowserProfile.COMMUNICATION)
+        if not allowed:
+            raise HTTPException(status_code=423, detail=reason)
+        return await connectors_runtime().google_status(request)
+
+    @app.post("/v1/connectors/google/oauth/start", dependencies=protected)
+    async def google_oauth_start(request: GoogleOAuthStartRequest) -> dict[str, Any]:
+        allowed, reason = await check_connector_locks(BrowserProfile.COMMUNICATION)
+        if not allowed:
+            raise HTTPException(status_code=423, detail=reason)
+        return connectors_runtime().google_oauth_start(request)
+
+    @app.post("/v1/connectors/google/oauth/exchange", dependencies=protected)
+    async def google_oauth_exchange(request: GoogleOAuthExchangeRequest) -> dict[str, Any]:
+        allowed, reason = await check_connector_locks(BrowserProfile.COMMUNICATION)
+        if not allowed:
+            raise HTTPException(status_code=423, detail=reason)
+        return await connectors_runtime().google_oauth_exchange(request)
+
+    @app.post("/v1/connectors/gmail/attachment", dependencies=protected)
+    async def gmail_attachment(request: GmailAttachmentRequest) -> dict[str, Any]:
+        allowed, reason = await check_connector_locks(BrowserProfile.COMMUNICATION)
+        if not allowed:
+            raise HTTPException(status_code=423, detail=reason)
+        return await connectors_runtime().gmail_attachment(request)
 
     @app.delete("/v1/profiles/{profile}", dependencies=protected)
     async def close_profile(profile: BrowserProfile) -> dict[str, str]:
@@ -358,6 +427,14 @@ def create_browser_worker_app(
                 profile=profile,
                 action=action.value,
                 warnings=[str(exc)],
+            )
+        except StaleBrowserReference as exc:
+            response = BrowserResult(
+                status="denied",
+                profile=profile,
+                action=action.value,
+                warnings=[str(exc), "FRESH_SNAPSHOT_REQUIRED"],
+                result={"executed": False, "verified": False},
             )
         except BrowserUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc

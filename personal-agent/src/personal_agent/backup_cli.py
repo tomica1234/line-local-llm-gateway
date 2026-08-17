@@ -27,6 +27,8 @@ def run() -> None:
     create.add_argument("--database", choices=("core", "secret"), default="core")
     inspect_command = commands.add_parser("inspect")
     inspect_command.add_argument("backup", type=Path)
+    verify_command = commands.add_parser("verify")
+    verify_command.add_argument("backup", type=Path)
     restore = commands.add_parser("restore")
     restore.add_argument("backup", type=Path)
     restore.add_argument("--database", choices=("core", "secret"), default="core")
@@ -38,6 +40,8 @@ def run() -> None:
         result = service.create(_database_path(args.database), args.destination)
     elif args.command == "inspect":
         result = service.inspect(args.backup)
+    elif args.command == "verify":
+        result = service.verify(args.backup)
     else:
         if args.replace and args.confirm_replace != "RESTORE":
             raise SystemExit("--replace requires --confirm-replace RESTORE")

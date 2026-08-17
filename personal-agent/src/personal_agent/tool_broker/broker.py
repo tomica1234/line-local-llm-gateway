@@ -8,6 +8,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
+from ..approval import ApprovalMaterial, generic_approval_material
 from ..audit import AuditLogger, redact
 from ..policy.engine import PolicyEngine, PolicyOutcome
 from ..storage import Storage
@@ -15,6 +16,7 @@ from ..types import RiskLevel, ToolResult
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
 ToolHandler = Callable[[BaseModel, "ToolContext"], ToolResult | Awaitable[ToolResult]]
+ApprovalMaterialBuilder = Callable[[BaseModel], ApprovalMaterial]
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +40,7 @@ class ToolDefinition(Generic[ArgsT]):
     risk_level: RiskLevel
     mutation: bool = False
     required_permissions: tuple[str, ...] = ()
+    approval_material_builder: ApprovalMaterialBuilder | None = None
 
 
 class ToolNotAvailable(KeyError):
@@ -178,12 +181,41 @@ class ToolBroker:
             )
         if decision.outcome is PolicyOutcome.REQUIRE_APPROVAL:
             raw_arguments = args.model_dump(mode="json")
+            material = self._approval_material(tool, args, audited_arguments)
             approval = self.storage.approval_for_action(
                 task_id=task_id,
                 tool_name=tool_name,
                 arguments=raw_arguments,
+                material=material,
             )
             if approval is None:
+                previous = self.storage.latest_approval_for_request(
+                    task_id=task_id,
+                    tool_name=tool_name,
+                    arguments=raw_arguments,
+                )
+                changed = bool(
+                    previous
+                    and previous.get("material_hash")
+                    and previous["material_hash"] != material.material_hash
+                )
+                if changed:
+                    self.storage.invalidate_approval(
+                        previous["approval_id"], reason_code="APPROVAL_MATERIAL_CHANGED"
+                    )
+                    self.audit.record(
+                        task_id=task_id,
+                        actor="tool_broker",
+                        action="approval.invalidate",
+                        result="denied",
+                        details={
+                            "approval_id": previous["approval_id"],
+                            "tool": tool_name,
+                            "reason_code": "APPROVAL_MATERIAL_CHANGED",
+                            "old_material_hash": previous["material_hash"],
+                            "current_material_hash": material.material_hash,
+                        },
+                    )
                 approval = self.storage.request_approval(
                     task_id=task_id,
                     tool_name=tool_name,
@@ -191,9 +223,48 @@ class ToolBroker:
                     input_summary=audited_arguments,
                     risk_level=tool.risk_level,
                     reason=reason,
+                    material=material,
                 )
+                if changed:
+                    return ToolResult(
+                        status="denied",
+                        requires_approval=True,
+                        evidence={
+                            "reason_code": "APPROVAL_MATERIAL_CHANGED",
+                            "approval_id": approval["approval_id"],
+                            "approval_material": approval["material"],
+                        },
+                        next_action="request_approval",
+                    )
             if approval["state"] == "approved":
-                if not self.storage.consume_approval(approval["approval_id"]):
+                current_material = self._approval_material(tool, args, audited_arguments)
+                if current_material.material_hash != approval["material_hash"]:
+                    self.storage.invalidate_approval(
+                        approval["approval_id"], reason_code="APPROVAL_MATERIAL_CHANGED"
+                    )
+                    replacement = self.storage.request_approval(
+                        task_id=task_id,
+                        tool_name=tool_name,
+                        arguments=raw_arguments,
+                        input_summary=audited_arguments,
+                        risk_level=tool.risk_level,
+                        reason=reason,
+                        material=current_material,
+                    )
+                    return ToolResult(
+                        status="denied",
+                        requires_approval=True,
+                        evidence={
+                            "reason_code": "APPROVAL_MATERIAL_CHANGED",
+                            "approval_id": replacement["approval_id"],
+                            "approval_material": replacement["material"],
+                        },
+                        next_action="request_approval",
+                    )
+                if not self.storage.consume_approval(
+                    approval["approval_id"],
+                    expected_material_hash=current_material.material_hash,
+                ):
                     return ToolResult(
                         status="denied",
                         evidence={"reason_code": "APPROVAL_CONSUME_CONFLICT"},
@@ -219,6 +290,7 @@ class ToolBroker:
                     evidence={
                         "reason_code": reason_code,
                         "approval_id": approval["approval_id"],
+                        "approval_material": approval["material"],
                     },
                     next_action=("request_approval" if approval["state"] == "pending" else None),
                 )
@@ -231,6 +303,8 @@ class ToolBroker:
             risk_level=tool.risk_level,
             reason=reason,
             input_data=audited_arguments,
+            step_id=step_id,
+            mutation=tool.mutation,
         )
         if previous is not None:
             duplicate = ToolResult.model_validate(previous)
@@ -292,6 +366,14 @@ class ToolBroker:
         )
         return result
 
+    @staticmethod
+    def _approval_material(
+        tool: ToolDefinition[Any], args: BaseModel, audited_arguments: dict[str, Any]
+    ) -> ApprovalMaterial:
+        if tool.approval_material_builder is not None:
+            return tool.approval_material_builder(args)
+        return generic_approval_material(tool.name, audited_arguments)
+
     def _record_capability_decision(
         self,
         *,
@@ -321,7 +403,15 @@ class ToolBroker:
     @staticmethod
     def _audit_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         safe = redact(arguments)
-        if tool_name == "browser.type" and "text" in safe:
+        if (
+            tool_name
+            in {
+                "browser.type",
+                "computer.clipboard.write",
+                "computer.desktop.type",
+            }
+            and "text" in safe
+        ):
             safe["text"] = f"[REDACTED:{len(str(arguments['text']))} chars]"
         if tool_name == "browser.upload" and "paths" in safe:
             paths = arguments.get("paths", [])

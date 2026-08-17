@@ -6,7 +6,7 @@ model_name="Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
 model_dir="${PERSONAL_AGENT_QWEN_MODEL_DIR:-$project_dir/models}"
 model_path="$model_dir/$model_name"
 partial_path="$model_path.part"
-expected_sha256="707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450"
+expected_sha256="707a55a8a4397ecde44de0c499d3e68c1ad1d240d1da65826b4949d1043f4450" # pragma: allowlist secret
 download_url="https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF/resolve/main/$model_name?download=true"
 
 if ! command -v curl >/dev/null 2>&1; then

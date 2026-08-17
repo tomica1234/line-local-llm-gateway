@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import ipaddress
 import socket
 import struct
@@ -74,6 +75,17 @@ class BrowserWorkerClient:
             response = await client.get(f"{self.base_url}/health", headers=self.headers)
             response.raise_for_status()
             return response.json()
+
+    async def quarantined_image(self, path: str) -> tuple[bytes, str]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/quarantine/image",
+                headers=self.headers,
+                json={"path": path},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        return base64.b64decode(payload["content_base64"]), str(payload["media_type"])
 
     async def close_profile(self, profile: BrowserProfile) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -194,6 +206,8 @@ class BrowserWorkerClient:
         thread_id: str | None,
         reply_to: str | None,
         context: ActionContext,
+        oauth_client_id_credential_id: str | None = None,
+        oauth_client_secret_credential_id: str | None = None,
     ) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
@@ -206,6 +220,8 @@ class BrowserWorkerClient:
                     "text": text,
                     "thread_id": thread_id,
                     "reply_to": reply_to,
+                    "oauth_client_id_credential_id": oauth_client_id_credential_id,
+                    "oauth_client_secret_credential_id": oauth_client_secret_credential_id,
                     "context": context.model_dump(mode="json"),
                 },
             )
@@ -220,6 +236,8 @@ class BrowserWorkerClient:
         task_id: str,
         query: str,
         limit: int,
+        oauth_client_id_credential_id: str | None = None,
+        oauth_client_secret_credential_id: str | None = None,
     ) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             response = await client.post(
@@ -230,6 +248,113 @@ class BrowserWorkerClient:
                     "task_id": task_id,
                     "query": query,
                     "limit": limit,
+                    "oauth_client_id_credential_id": oauth_client_id_credential_id,
+                    "oauth_client_secret_credential_id": oauth_client_secret_credential_id,
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def google_calendar_request(
+        self,
+        *,
+        refresh_credential_id: str,
+        client_id_credential_id: str,
+        client_secret_credential_id: str,
+        task_id: str,
+        operation: str,
+        calendar_id: str,
+        event_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/connectors/google-calendar",
+                headers=self.headers,
+                json={
+                    "credentials": {
+                        "refresh_credential_id": refresh_credential_id,
+                        "client_id_credential_id": client_id_credential_id,
+                        "client_secret_credential_id": client_secret_credential_id,
+                    },
+                    "task_id": task_id,
+                    "operation": operation,
+                    "calendar_id": calendar_id,
+                    "event_id": event_id,
+                    "payload": payload or {},
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def google_oauth_start(
+        self,
+        *,
+        task_id: str,
+        client_id_credential_id: str,
+        client_secret_credential_id: str,
+        refresh_credential_id: str,
+        redirect_uri: str,
+        scopes: list[str],
+        account_label: str,
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/connectors/google/oauth/start",
+                headers=self.headers,
+                json={
+                    "task_id": task_id,
+                    "client_id_credential_id": client_id_credential_id,
+                    "client_secret_credential_id": client_secret_credential_id,
+                    "refresh_credential_id": refresh_credential_id,
+                    "redirect_uri": redirect_uri,
+                    "scopes": scopes,
+                    "account_label": account_label,
+                },
+            )
+            response.raise_for_status()
+            return response.json()
+
+    async def google_oauth_exchange(self, *, state: str, code: str) -> dict[str, Any]:
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.post(
+                    f"{self.base_url}/connectors/google/oauth/exchange",
+                    headers=self.headers,
+                    json={"state": state, "code": code},
+                )
+                response.raise_for_status()
+                return response.json()
+        finally:
+            code = ""
+
+    async def gmail_attachment(
+        self,
+        *,
+        refresh_credential_id: str,
+        client_id_credential_id: str,
+        client_secret_credential_id: str,
+        task_id: str,
+        message_id: str,
+        attachment_id: str,
+        filename: str,
+        media_type: str,
+    ) -> dict[str, Any]:
+        async with httpx.AsyncClient(timeout=max(self.timeout, 60)) as client:
+            response = await client.post(
+                f"{self.base_url}/connectors/gmail/attachment",
+                headers=self.headers,
+                json={
+                    "credentials": {
+                        "refresh_credential_id": refresh_credential_id,
+                        "client_id_credential_id": client_id_credential_id,
+                        "client_secret_credential_id": client_secret_credential_id,
+                    },
+                    "task_id": task_id,
+                    "message_id": message_id,
+                    "attachment_id": attachment_id,
+                    "filename": filename,
+                    "media_type": media_type,
                 },
             )
             response.raise_for_status()

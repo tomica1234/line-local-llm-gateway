@@ -12,6 +12,7 @@ from uuid import uuid4
 from pydantic import BaseModel
 
 from ..secret.models import SecretAction
+from .adapters import AdapterPage, SiteAdapterRegistry
 from .config import BrowserWorkerSettings
 from .models import (
     ActionContext,
@@ -53,6 +54,10 @@ class SecretInputRequired(PermissionError):
     pass
 
 
+class StaleBrowserReference(RuntimeError):
+    pass
+
+
 @dataclass(slots=True)
 class Takeover:
     reason: str
@@ -68,10 +73,13 @@ class ProfileSession:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     takeover: Takeover | None = None
     timed_out_task_id: str | None = None
+    snapshot_id: str | None = None
+    snapshot_url: str | None = None
 
 
 SNAPSHOT_SCRIPT = r"""
-() => {
+(snapshotId) => {
+  document.documentElement.dataset.paSnapshotId = snapshotId;
   const candidates = Array.from(document.querySelectorAll(
     'a,button,input,textarea,select,summary,[role],[contenteditable="true"],h1,h2,h3'
   ));
@@ -126,7 +134,12 @@ SNAPSHOT_SCRIPT = r"""
       disabled: 'disabled' in el ? Boolean(el.disabled) : null
     });
   }
-  return {title: document.title, nodes, truncated: candidates.length > nodes.length};
+  return {
+    title: document.title,
+    nodes,
+    truncated: candidates.length > nodes.length,
+    snapshot_id: snapshotId
+  };
 }
 """
 
@@ -198,6 +211,7 @@ class PlaywrightController:
         self._playwright: Any | None = None
         self._sessions: dict[BrowserProfile, ProfileSession] = {}
         self._create_lock = asyncio.Lock()
+        self.adapters = SiteAdapterRegistry.defaults()
 
     async def start(self) -> None:
         if self._playwright is not None:
@@ -343,7 +357,7 @@ class PlaywrightController:
             if session.takeover is not None or session.timed_out_task_id is not None:
                 raise HumanTakeoverActive("Secret fill is locked while human takeover is active")
             page = self._page(session)
-            locator = self._ref(page, ref)
+            locator = await self._ref(session, page, ref)
             if not await locator.evaluate(SECRET_FIELD_SCRIPT, action.value):
                 raise SecretInputRequired("Target field is incompatible with the secret action")
             await locator.fill(value)
@@ -499,18 +513,62 @@ class PlaywrightController:
                     raise ValueError("Navigation URL must include a hostname")
                 await asyncio.to_thread(validate_resolved_hostname, hostname)
             response = await page.goto(url, wait_until="domcontentloaded")
-            return {"url": page.url, "http_status": response.status if response else None}
+            await self._stabilize(page)
+            session.snapshot_id = None
+            session.snapshot_url = None
+            return {
+                "url": page.url,
+                "http_status": response.status if response else None,
+                "page_fingerprint": await self._page_fingerprint(page),
+            }
         if action is BrowserAction.SNAPSHOT:
-            snapshot = await page.evaluate(SNAPSHOT_SCRIPT)
-            return {**snapshot, "url": page.url, "trust_level": "untrusted"}
+            await self._stabilize(page)
+            snapshot = await page.evaluate(SNAPSHOT_SCRIPT, str(uuid4()))
+            session.snapshot_id = str(snapshot["snapshot_id"])
+            session.snapshot_url = page.url
+            adapter = self._adapter_page(
+                url=page.url,
+                title=str(snapshot.get("title", "")),
+                text=" ".join(str(node.get("name", "")) for node in snapshot.get("nodes", [])),
+            )
+            return {
+                **snapshot,
+                "url": page.url,
+                "page_fingerprint": await self._page_fingerprint(page),
+                "trust_level": "untrusted",
+                "site_adapter": adapter.adapter_id if adapter else None,
+                "login_state": adapter.login_state(
+                    AdapterPage(
+                        url=page.url,
+                        title=str(snapshot.get("title", "")),
+                        text=" ".join(
+                            str(node.get("name", "")) for node in snapshot.get("nodes", [])
+                        ),
+                    )
+                )
+                if adapter
+                else "unknown",
+            }
         if action is BrowserAction.CLICK:
             parsed = RefParams.model_validate(params)
-            locator = self._ref(page, parsed.ref)
+            before = await self._page_fingerprint(page)
+            pages_before = list(session.context.pages)
+            locator = await self._ref(session, page, parsed.ref)
             await locator.click()
-            return {"ref": parsed.ref, "url": page.url}
+            await self._activate_popup(session, pages_before)
+            current = self._page(session)
+            await self._stabilize(current)
+            after = await self._page_fingerprint(current)
+            return {
+                "ref": parsed.ref,
+                "url": current.url,
+                "page_changed": before != after,
+                "page_fingerprint": after,
+                "popup_opened": len(session.context.pages) > len(pages_before),
+            }
         if action is BrowserAction.TYPE:
             parsed = TypeParams.model_validate(params)
-            locator = self._ref(page, parsed.ref)
+            locator = await self._ref(session, page, parsed.ref)
             if await locator.evaluate(SENSITIVE_ELEMENT_SCRIPT):
                 raise SecretInputRequired(
                     "Sensitive inputs require Secret Broker direct-fill; browser.type is forbidden"
@@ -522,11 +580,13 @@ class PlaywrightController:
             return {"ref": parsed.ref, "characters": len(parsed.text)}
         if action is BrowserAction.SELECT:
             parsed = SelectParams.model_validate(params)
-            selected = await self._ref(page, parsed.ref).select_option(parsed.values)
+            selected = await (await self._ref(session, page, parsed.ref)).select_option(
+                parsed.values
+            )
             return {"ref": parsed.ref, "selected": selected}
         if action is BrowserAction.CHECK:
             parsed = CheckParams.model_validate(params)
-            locator = self._ref(page, parsed.ref)
+            locator = await self._ref(session, page, parsed.ref)
             if parsed.checked:
                 await locator.check()
             else:
@@ -537,27 +597,44 @@ class PlaywrightController:
             paths = [
                 validate_upload_path(item, self.settings.upload_roots) for item in parsed.paths
             ]
-            await self._ref(page, parsed.ref).set_input_files([str(path) for path in paths])
-            return {"ref": parsed.ref, "file_count": len(paths)}
+            locator = await self._ref(session, page, parsed.ref)
+            await locator.set_input_files([str(path) for path in paths])
+            uploaded = await locator.evaluate(
+                "el => Array.from(el.files || []).map(file => ({name: file.name, size: file.size}))"
+            )
+            if len(uploaded) != len(paths):
+                raise RuntimeError("File upload verification failed")
+            return {
+                "ref": parsed.ref,
+                "file_count": len(paths),
+                "verified": True,
+                "files": uploaded,
+            }
         if action is BrowserAction.DOWNLOAD:
             if profile is BrowserProfile.FINANCE:
                 raise PermissionError("Downloads are disabled for the finance profile")
             parsed = DownloadParams.model_validate(params)
             async with page.expect_download(timeout=parsed.timeout_ms) as download_info:
-                await self._ref(page, parsed.ref).click()
+                await (await self._ref(session, page, parsed.ref)).click()
             download = await download_info.value
             target = quarantine_path(
                 self.settings.quarantine_root, profile, download.suggested_filename
             )
             await download.save_as(str(target))
+            failure = await download.failure()
+            if failure:
+                target.unlink(missing_ok=True)
+                raise RuntimeError(f"Browser download failed: {failure}")
             digest = hashlib.sha256(target.read_bytes()).hexdigest()
             return {
                 "download_id": target.stem,
                 "path": str(target),
                 "size": target.stat().st_size,
                 "sha256": digest,
+                "suggested_filename": download.suggested_filename,
                 "quarantined": True,
                 "executed": False,
+                "completed": True,
             }
         if action is BrowserAction.TABS:
             return {
@@ -594,20 +671,26 @@ class PlaywrightController:
             return {"index": parsed.index, "url": session.active_page.url}
         if action is BrowserAction.BACK:
             response = await page.go_back(wait_until="domcontentloaded")
+            await self._stabilize(page)
+            session.snapshot_id = None
             return {"url": page.url, "http_status": response.status if response else None}
         if action is BrowserAction.FORWARD:
             response = await page.go_forward(wait_until="domcontentloaded")
+            await self._stabilize(page)
+            session.snapshot_id = None
             return {"url": page.url, "http_status": response.status if response else None}
         if action is BrowserAction.RELOAD:
             response = await page.reload(wait_until="domcontentloaded")
+            await self._stabilize(page)
+            session.snapshot_id = None
             return {"url": page.url, "http_status": response.status if response else None}
         if action is BrowserAction.HOVER:
             parsed = RefParams.model_validate(params)
-            await self._ref(page, parsed.ref).hover()
+            await (await self._ref(session, page, parsed.ref)).hover()
             return {"ref": parsed.ref, "url": page.url}
         if action is BrowserAction.PRESS:
             parsed = PressParams.model_validate(params)
-            await self._ref(page, parsed.ref).press(parsed.key)
+            await (await self._ref(session, page, parsed.ref)).press(parsed.key)
             return {"ref": parsed.ref, "key": parsed.key, "url": page.url}
         if action is BrowserAction.SCROLL:
             parsed = ScrollParams.model_validate(params)
@@ -627,7 +710,10 @@ class PlaywrightController:
             )
             before_count = await confirmation.count() if confirmation is not None else 0
             before_url = page.url
-            await self._ref(page, parsed.ref).click()
+            before_fingerprint = await self._page_fingerprint(page)
+            pages_before = list(session.context.pages)
+            await (await self._ref(session, page, parsed.ref)).click()
+            await self._activate_popup(session, pages_before)
             deadline = asyncio.get_running_loop().time() + (parsed.timeout_ms / 1_000)
             verified_by: str | None = None
             after_count = before_count
@@ -643,6 +729,9 @@ class PlaywrightController:
                         break
                 await current_page.wait_for_timeout(200)
             current_page = self._page(session)
+            await self._stabilize(current_page)
+            after_fingerprint = await self._page_fingerprint(current_page)
+            confirmation_evidence = await self._confirmation_evidence(current_page)
             return {
                 "ref": parsed.ref,
                 "before_url": before_url,
@@ -650,11 +739,15 @@ class PlaywrightController:
                 "verified": verified_by is not None,
                 "verified_by": verified_by,
                 "confirmation_count_increased": after_count > before_count,
+                "page_changed": before_fingerprint != after_fingerprint,
+                "page_fingerprint": after_fingerprint,
+                "confirmation": confirmation_evidence,
+                "popup_opened": len(session.context.pages) > len(pages_before),
             }
         if action is BrowserAction.WAIT:
             parsed = WaitParams.model_validate(params)
             if parsed.ref:
-                await self._ref(page, parsed.ref).wait_for(
+                await (await self._ref(session, page, parsed.ref)).wait_for(
                     state="visible", timeout=parsed.timeout_ms
                 )
             else:
@@ -710,11 +803,122 @@ class PlaywrightController:
             return {"downloads": items}
         raise ValueError(f"Unsupported browser action: {action.value}")
 
-    @staticmethod
-    def _ref(page: Any, ref: str) -> Any:
+    async def _ref(self, session: ProfileSession, page: Any, ref: str) -> Any:
         if not re.fullmatch(r"ref-[1-9][0-9]*", ref):
             raise ValueError("Invalid DOM reference")
-        return page.locator(f'[data-pa-ref="{ref}"]').first
+        if not session.snapshot_id:
+            raise StaleBrowserReference("A fresh browser.snapshot is required")
+        try:
+            current_snapshot_id = await page.evaluate(
+                "() => document.documentElement.dataset.paSnapshotId || null"
+            )
+        except Exception as exc:
+            raise StaleBrowserReference("The page changed after the last snapshot") from exc
+        if current_snapshot_id != session.snapshot_id or page.url != session.snapshot_url:
+            raise StaleBrowserReference("The page changed after the last snapshot")
+        locator = page.locator(f'[data-pa-ref="{ref}"]').first
+        for attempt in range(3):
+            try:
+                if await locator.count() and await locator.is_visible():
+                    return locator
+            except Exception:
+                pass
+            if attempt < 2:
+                await page.wait_for_timeout(150 * (attempt + 1))
+        raise StaleBrowserReference(f"DOM reference {ref} is stale; take a new snapshot")
+
+    @staticmethod
+    async def _stabilize(page: Any, *, timeout_ms: int = 2_000) -> None:
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=timeout_ms)
+        except Exception:
+            pass
+        previous: tuple[int, int] | None = None
+        stable = 0
+        for _ in range(8):
+            try:
+                current = tuple(
+                    await page.evaluate(
+                        "() => [document.querySelectorAll('*').length, "
+                        "(document.body?.innerText || '').length]"
+                    )
+                )
+            except Exception:
+                return
+            stable = stable + 1 if current == previous else 0
+            if stable >= 2:
+                return
+            previous = current
+            await page.wait_for_timeout(100)
+
+    @staticmethod
+    async def _page_fingerprint(page: Any) -> str:
+        try:
+            material = await page.evaluate(
+                "() => [location.href, document.title, "
+                "(document.body?.innerText || '').slice(0, 2000)].join('\\n')"
+            )
+        except Exception:
+            material = f"{page.url}\n"
+        return hashlib.sha256(str(material).encode()).hexdigest()
+
+    @staticmethod
+    async def _activate_popup(session: ProfileSession, pages_before: list[Any]) -> None:
+        new_pages = [item for item in session.context.pages if item not in pages_before]
+        if not new_pages:
+            return
+        popup = new_pages[-1]
+        try:
+            await popup.wait_for_load_state("domcontentloaded", timeout=3_000)
+        except Exception:
+            pass
+        session.active_page = popup
+        await popup.bring_to_front()
+        session.snapshot_id = None
+        session.snapshot_url = None
+
+    async def _confirmation_evidence(self, page: Any) -> dict[str, Any]:
+        try:
+            text = str(await page.locator("body").inner_text(timeout=2_000))[:200_000]
+        except Exception:
+            return {"confirmation_number": None, "booking_id": None, "receipt_url": None}
+        title = ""
+        try:
+            title = await page.title()
+        except Exception:
+            pass
+        adapter_page = AdapterPage(url=page.url, title=title, text=text)
+        adapter = self.adapters.resolve(adapter_page)
+        if adapter:
+            result = adapter.extract_confirmation(adapter_page)
+            result["receipt_url"] = None
+        else:
+            result = {"receipt_url": None, "adapter_id": None}
+        patterns = {
+            "confirmation_number": (
+                r"(?i)(?:confirmation|確認)(?:\s*(?:number|番号|no\.?))?"
+                r"\s*[:#：]?\s*([A-Z0-9-]{5,40})"
+            ),
+            "booking_id": (
+                r"(?i)(?:booking|reservation|予約)(?:\s*(?:id|番号|no\.?))?"
+                r"\s*[:#：]?\s*([A-Z0-9-]{5,40})"
+            ),
+        }
+        for key, pattern in patterns.items():
+            match = re.search(pattern, text)
+            if not result.get(key):
+                result[key] = match.group(1) if match else None
+        try:
+            receipt = page.locator('a[href*="receipt" i],a[href*="領収" i]').first
+            result["receipt_url"] = (
+                await receipt.get_attribute("href") if await receipt.count() else None
+            )
+        except Exception:
+            result["receipt_url"] = None
+        return result
+
+    def _adapter_page(self, *, url: str, title: str, text: str) -> Any | None:
+        return self.adapters.resolve(AdapterPage(url=url, title=title, text=text))
 
     @staticmethod
     def _page(session: ProfileSession) -> Any:

@@ -55,9 +55,9 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
         goal,
         r"(今日は|昨日は|最近).*(した|だった|嬉しかった|疲れた|楽しかった|つらかった|学んだ|気づいた)",
     ) and not _matches(goal, r"調べて|探して|検索して")
-    diary_signal = _matches(
-        goal, r"日記|diary|今日やったこと|昨日やったこと"
-    ) or natural_diary_signal
+    diary_signal = (
+        _matches(goal, r"日記|diary|今日やったこと|昨日やったこと") or natural_diary_signal
+    )
     todo_completion_signal = not diary_signal and _matches(
         goal,
         r"完了|終わった|済んだ|できた|提出した|払った|連絡した|直した|作った|complete",
@@ -69,9 +69,10 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
     todo_signal = todo_create_signal or todo_completion_signal
 
     if todo_signal:
-        if _matches(
-            goal, r"一覧|見せて|表示|確認|残って|未完了|show|list"
-        ) or todo_completion_signal:
+        if (
+            _matches(goal, r"一覧|見せて|表示|確認|残って|未完了|show|list")
+            or todo_completion_signal
+        ):
             add(
                 "Personal Todoを参照する",
                 {"todo.list"},
@@ -101,6 +102,20 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 {"todo.write"},
                 RiskLevel.R1,
             )
+        if _matches(goal, r"スヌーズ|あとで通知|30分後|1時間後|今夜|明日の朝|snooze"):
+            add(
+                "Personal Todoの通知を指定時刻まで延期する",
+                {"todo.snooze"},
+                {"todo.write"},
+                RiskLevel.R1,
+            )
+        if _matches(goal, r"todo.*削除|タスク.*削除|やること.*削除|delete.*todo"):
+            add(
+                "指定されたPersonal Todoと未発火通知を削除する",
+                {"todo.delete"},
+                {"todo.write"},
+                RiskLevel.R1,
+            )
 
     if diary_signal:
         if _matches(goal, r"見せて|読む|表示|今日の日記|昨日の日記|show|read"):
@@ -118,8 +133,7 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 RiskLevel.R0,
             )
         if (
-            natural_diary_signal
-            or _matches(goal, r"書いて|記録|追加|登録|日記[:：\s]|create|add")
+            natural_diary_signal or _matches(goal, r"書いて|記録|追加|登録|日記[:：\s]|create|add")
         ) and not _matches(goal, r"見せて|読む|表示|検索|探して|show|read|search"):
             add(
                 "日記を構造化して記録する",
@@ -128,10 +142,13 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 RiskLevel.R1,
             )
 
-    browser_signal = _matches(
-        goal,
-        r"https?://|ブラウザ|サイト|ウェブ|\bweb\b|検索して|調べて|フォーム|ページ|比較して",
-    ) and not diary_signal
+    browser_signal = (
+        _matches(
+            goal,
+            r"https?://|ブラウザ|サイト|ウェブ|\bweb\b|検索して|調べて|フォーム|ページ|比較して",
+        )
+        and not diary_signal
+    )
     if browser_signal:
         add(
             "外部Webを読み取り、候補や根拠を集める",
@@ -149,6 +166,7 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 "browser.scroll",
                 "browser.wait",
                 "browser.screenshot",
+                "browser.vision_analyze",
                 "browser.get_url",
                 "browser.get_downloads",
             },
@@ -195,6 +213,14 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
     communication_signal = _matches(
         goal, r"line|slack|メール|gmail|sms|メッセージ|返信|下書き|送信"
     )
+    contact_signal = _matches(goal, r"連絡先|contacts?|さんに|宛先|メールアドレス")
+    if contact_signal:
+        add(
+            "人名と実際の送信先を高信頼で解決する",
+            {"contacts.search", "contacts.get", "contacts.resolve"},
+            {"contacts.read"},
+            RiskLevel.R0,
+        )
     if communication_signal and _matches(
         goal, r"検索|探して|読んで|見せて|確認|履歴|スレッド|同期|search|read|thread"
     ):
@@ -234,7 +260,7 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
     if calendar_signal:
         add(
             "カレンダーの予定または空き時間を読む",
-            {"calendar.search", "calendar.get_availability"},
+            {"calendar.search", "calendar.get_availability", "calendar.provider_sync"},
             {"calendar.read"},
             RiskLevel.R0,
         )
@@ -250,7 +276,15 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
     if file_signal:
         add(
             "許可されたroot内のファイルを検索・参照する",
-            {"files.search", "files.read"},
+            {
+                "files.search",
+                "files.read",
+                "files.inspect",
+                "files.extract_text",
+                "files.extract_metadata",
+                "files.list_archive",
+                "files.vision_analyze",
+            },
             {"files.read"},
             RiskLevel.R0,
         )
@@ -271,9 +305,7 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 RiskLevel.R2 if "files.delete" in write_tools else RiskLevel.R1,
             )
 
-    economic_signal = _matches(
-        goal, r"買|購入|予約|契約|サブスク|返金|返品|支払|送金|振込"
-    )
+    economic_signal = _matches(goal, r"買|購入|予約|契約|サブスク|返金|返品|支払|送金|振込")
     if economic_signal:
         add(
             "購入・予約・送金の内容と最終条件を準備する",
@@ -282,8 +314,13 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 "economic.set_final_quote",
                 "money.create_transfer_intent",
                 "money.reconcile",
+                "commerce.create",
+                "commerce.set_candidates",
+                "commerce.select",
+                "commerce.set_final_quote",
+                "commerce.get",
             },
-            {"economic.prepare", "economic.read"},
+            {"economic.prepare", "economic.read", "commerce.prepare", "commerce.read"},
             RiskLevel.R1,
         )
         if _matches(goal, r"購入して|予約して|支払って|送金して|振り込んで|実行して"):
@@ -292,6 +329,12 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 {"economic.execute_sandbox", "money.execute_transfer_sandbox"},
                 {"economic.execute"},
                 RiskLevel.R3,
+            )
+            add(
+                "ブラウザ送信結果を再送せず証拠と照合する",
+                {"commerce.record_submission", "commerce.reconcile", "commerce.get"},
+                {"commerce.reconcile", "commerce.read"},
+                RiskLevel.R1,
             )
 
     if _matches(goal, r"home assistant|家電|照明|ライト|エアコン|温度|シーン"):
@@ -309,13 +352,64 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
                 RiskLevel.R2,
             )
 
-    if _matches(goal, r"pc|パソコン|computer|os状態"):
+    computer_signal = _matches(
+        goal, r"pc|パソコン|computer|os状態|プロセス|clipboard|クリップボード|デスクトップ"
+    )
+    if computer_signal:
         add(
             "ローカルPCの限定された状態を読む",
-            {"computer.get_status"},
+            {
+                "computer.get_status",
+                "computer.process.list",
+                "computer.process.status",
+                "computer.app.list",
+                "computer.job.status",
+            },
             {"computer.read"},
             RiskLevel.R0,
         )
+    if _matches(goal, r"プロセス.*停止|process.*stop"):
+        add(
+            "Agentが開始したプロセスだけを停止する",
+            {"computer.process.stop"},
+            {"computer.process.stop"},
+            RiskLevel.R2,
+        )
+    if _matches(goal, r"アプリ.*起動|app.*launch|アプリ.*閉じ|app.*close"):
+        add(
+            "Allowlistされたアプリを起動または終了する",
+            {"computer.app.launch", "computer.app.close"},
+            {"computer.app.launch"},
+            RiskLevel.R2,
+        )
+    if _matches(goal, r"コマンド|command|ジョブ|job"):
+        add(
+            "固定Allowlist commandをshellなしで実行・管理する",
+            {
+                "computer.job.start",
+                "computer.job.status",
+                "computer.job.cancel",
+                "computer.command.run",
+            },
+            {"computer.job.run", "computer.command.run", "computer.read"},
+            RiskLevel.R2,
+        )
+    if _matches(goal, r"clipboard|クリップボード"):
+        permissions = {"computer.clipboard.read"}
+        tools = {"computer.clipboard.read"}
+        if _matches(goal, r"書|貼|入れて|write"):
+            permissions.add("computer.clipboard.write")
+            tools.add("computer.clipboard.write")
+        add("クリップボードを限定操作する", tools, permissions, RiskLevel.R1)
+    if _matches(goal, r"デスクトップ|desktop|画面.*クリック|画面.*入力"):
+        tools = {"computer.desktop.snapshot"}
+        permissions = {"computer.desktop.read"}
+        risk = RiskLevel.R1
+        if _matches(goal, r"クリック|入力|click|type"):
+            tools |= {"computer.desktop.click", "computer.desktop.type"}
+            permissions.add("computer.desktop.interact")
+            risk = RiskLevel.R2
+        add("ローカルDesktopを座標監査付きで操作する", tools, permissions, risk)
     if _matches(goal, r"PC通知|パソコン.*通知|computer.*notify"):
         add(
             "ローカルPC通知を作る",
@@ -338,6 +432,27 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
             {"learning.propose"},
             RiskLevel.R1,
         )
+
+    if _matches(goal, r"codex|coding|github.*repo|git.*repo|リポジトリ|テスト.*直|ci.*直"):
+        add(
+            "AllowlistされたGit repositoryの状態を確認する",
+            {"coding.repo.status", "coding.repo.open", "coding.codex.status"},
+            {"coding.read"},
+            RiskLevel.R0,
+        )
+        if _matches(goal, r"直して|修正|実装|開始|やって|run|fix|start|送って"):
+            add(
+                "Sandbox内でdurable Coding Agent jobを開始・管理する",
+                {
+                    "coding.codex.start",
+                    "coding.codex.send",
+                    "coding.codex.status",
+                    "coding.codex.cancel",
+                    "coding.tests.run",
+                },
+                {"coding.execute", "coding.test", "coding.read"},
+                RiskLevel.R2,
+            )
 
     return tuple(steps)
 

@@ -4,6 +4,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from ..approval import ApprovalMaterial
 from ..tool_broker.broker import ToolContext, ToolDefinition
 from ..types import RiskLevel, ToolResult
 from .models import EconomicIntentCreate, FinalQuote, TransferIntentCreate
@@ -38,6 +39,58 @@ class TransactionIdArgs(BaseModel):
 
 
 def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
+    def economic_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = IntentIdArgs.model_validate(args)
+        intent = store.intent(parsed.economic_intent_id)
+        quote = intent.get("final_quote") or {}
+        payload = {
+            "provider_or_site": intent.get("provider"),
+            "item_or_service": quote.get("item") or intent.get("target"),
+            "quantity": quote.get("quantity"),
+            "seller": quote.get("seller"),
+            "unit_price": quote.get("unit_price"),
+            "shipping": quote.get("shipping"),
+            "fee": quote.get("fees"),
+            "tax": (intent.get("conditions") or {}).get("tax"),
+            "total": quote.get("total") or intent.get("amount"),
+            "currency": quote.get("currency") or intent.get("currency"),
+            "delivery_or_reservation_date": quote.get("delivery_at"),
+            "cancellation_policy": (
+                quote.get("cancellation_policy") or intent.get("cancellation_policy")
+            ),
+            "payment_method_reference": intent.get("payment_method_ref"),
+            "economic_intent_id": parsed.economic_intent_id,
+        }
+        return ApprovalMaterial.create(
+            action_type="economic.execute_sandbox",
+            title=f"{intent.get('action_type', 'economic')}を確定",
+            human_summary=(
+                f"{payload['total']} {payload['currency']} の表示条件で1回だけ実行します。"
+            ),
+            structured_payload=payload,
+        )
+
+    def transfer_material(args: BaseModel) -> ApprovalMaterial:
+        parsed = IntentIdArgs.model_validate(args)
+        intent = store.intent(parsed.economic_intent_id)
+        quote = intent.get("final_quote") or {}
+        payee = store.payee(str(quote.get("payee_id") or intent.get("target")))
+        payload = {
+            "payee_display_name": payee["display_name"],
+            "payee_id": payee["payee_id"],
+            "amount": quote.get("amount") or intent.get("amount"),
+            "currency": quote.get("currency") or intent.get("currency"),
+            "fee": quote.get("fee", "0"),
+            "purpose": quote.get("purpose") or (intent.get("conditions") or {}).get("purpose"),
+            "economic_intent_id": parsed.economic_intent_id,
+        }
+        return ApprovalMaterial.create(
+            action_type="money.execute_transfer_sandbox",
+            title=f"{payee['display_name']}へのsandbox送金",
+            human_summary=f"{payload['amount']} {payload['currency']}をsandboxで送金します。",
+            structured_payload=payload,
+        )
+
     def create_intent(args: BaseModel, context: ToolContext) -> ToolResult:
         parsed = IntentArgs.model_validate(args)
         intent = store.create_intent(
@@ -150,6 +203,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             risk_level=RiskLevel.R3,
             mutation=True,
             required_permissions=("economic.execute",),
+            approval_material_builder=economic_material,
         ),
         ToolDefinition(
             name="money.create_transfer_intent",
@@ -171,6 +225,7 @@ def economic_tools(store: EconomicStore) -> list[ToolDefinition[Any]]:
             risk_level=RiskLevel.R3,
             mutation=True,
             required_permissions=("economic.execute",),
+            approval_material_builder=transfer_material,
         ),
         ToolDefinition(
             name="money.reconcile",

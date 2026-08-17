@@ -51,9 +51,7 @@ class AuthBrowserController(Protocol):
 
 
 _OTP = re.compile(r"otp|totp|one.?time|verification.?code|認証コード|確認コード", re.I)
-_USERNAME = re.compile(
-    r"username|user.?id|login|account|e.?mail|ユーザー|メール|アカウント", re.I
-)
+_USERNAME = re.compile(r"username|user.?id|login|account|e.?mail|ユーザー|メール|アカウント", re.I)
 _SUBMIT = re.compile(r"log.?in|sign.?in|continue|next|verify|submit|ログイン|次へ|確認", re.I)
 _ERROR = re.compile(r"incorrect|invalid|failed|try again|誤り|正しくありません|失敗", re.I)
 
@@ -516,10 +514,7 @@ class AuthOrchestrator:
                 and item.get("type") != "password"
                 and not item.get("value")
                 and _USERNAME.search(
-                    " ".join(
-                        str(item.get(key) or "")
-                        for key in ("name", "type", "autocomplete")
-                    )
+                    " ".join(str(item.get(key) or "") for key in ("name", "type", "autocomplete"))
                 )
             ),
             None,

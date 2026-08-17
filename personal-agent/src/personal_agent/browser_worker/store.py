@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
@@ -71,6 +72,22 @@ class BrowserWorkerStore:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS connector_oauth_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    state_hash TEXT NOT NULL UNIQUE,
+                    task_id TEXT NOT NULL,
+                    client_id_credential_id TEXT NOT NULL,
+                    client_secret_credential_id TEXT NOT NULL,
+                    refresh_credential_id TEXT NOT NULL,
+                    redirect_uri TEXT NOT NULL,
+                    scopes_json TEXT NOT NULL,
+                    account_label TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_connector_oauth_expiry
+                ON connector_oauth_sessions(consumed_at, expires_at);
                 """
             )
 
@@ -257,3 +274,67 @@ class BrowserWorkerStore:
                 "SELECT * FROM auth_sessions ORDER BY updated_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def put_oauth_session(
+        self,
+        *,
+        session_id: str,
+        state: str,
+        task_id: str,
+        client_id_credential_id: str,
+        client_secret_credential_id: str,
+        refresh_credential_id: str,
+        redirect_uri: str,
+        scopes: list[str],
+        account_label: str,
+        ttl_seconds: int = 600,
+    ) -> None:
+        now = datetime.now(UTC)
+        expires = now + timedelta(seconds=ttl_seconds)
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "DELETE FROM connector_oauth_sessions WHERE expires_at < ? OR "
+                "consumed_at IS NOT NULL",
+                (now.isoformat(),),
+            )
+            connection.execute(
+                "INSERT INTO connector_oauth_sessions(session_id, state_hash, task_id, "
+                "client_id_credential_id, client_secret_credential_id, "
+                "refresh_credential_id, redirect_uri, scopes_json, account_label, "
+                "expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    hashlib.sha256(state.encode()).hexdigest(),
+                    task_id,
+                    client_id_credential_id,
+                    client_secret_credential_id,
+                    refresh_credential_id,
+                    redirect_uri,
+                    json.dumps(scopes),
+                    account_label,
+                    expires.isoformat(),
+                    now.isoformat(),
+                ),
+            )
+
+    def consume_oauth_session(self, state: str) -> dict[str, Any]:
+        now = datetime.now(UTC)
+        digest = hashlib.sha256(state.encode()).hexdigest()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM connector_oauth_sessions WHERE state_hash=? "
+                "AND consumed_at IS NULL AND expires_at>=?",
+                (digest, now.isoformat()),
+            ).fetchone()
+            if row is None:
+                raise PermissionError("OAuth state is invalid, expired, or already consumed")
+            connection.execute(
+                "UPDATE connector_oauth_sessions SET consumed_at=? WHERE session_id=? "
+                "AND consumed_at IS NULL",
+                (now.isoformat(), row["session_id"]),
+            )
+        result = dict(row)
+        result["scopes"] = json.loads(result.pop("scopes_json"))
+        result.pop("state_hash", None)
+        return result

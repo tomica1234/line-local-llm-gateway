@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from ..storage import Storage, utc_now
+from .embedding import EmbeddingProvider
 from .models import (
     EntityCreate,
     EventCreate,
@@ -73,6 +75,23 @@ CREATE TABLE IF NOT EXISTS memory_evidence (
     memory_id TEXT NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
     event_id TEXT NOT NULL REFERENCES raw_events(event_id) ON DELETE RESTRICT,
     PRIMARY KEY(memory_id, event_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(memory_id) ON DELETE CASCADE,
+    model_id TEXT NOT NULL,
+    vector_json TEXT NOT NULL,
+    dimensions INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_relations (
+    source_memory_id TEXT NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
+    target_memory_id TEXT NOT NULL REFERENCES memories(memory_id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL,
+    evidence_event_ids_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(source_memory_id, target_memory_id, relation_type)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -160,9 +179,16 @@ def _fts_trigram_or_query(text: str, *, max_terms: int = 64) -> str:
 
 
 class MemoryStore:
-    def __init__(self, storage: Storage, *, default_raw_retention_days: int = 90):
+    def __init__(
+        self,
+        storage: Storage,
+        *,
+        default_raw_retention_days: int = 90,
+        embedding_provider: EmbeddingProvider | None = None,
+    ):
         self.storage = storage
         self.default_raw_retention_days = default_raw_retention_days
+        self.embedding_provider = embedding_provider
 
     def initialize(self) -> None:
         with self.storage.transaction() as connection:
@@ -302,6 +328,25 @@ class MemoryStore:
                 "INSERT INTO memory_evidence(memory_id, event_id) VALUES (?, ?)",
                 [(memory_id, event_id) for event_id in evidence_ids],
             )
+            if memory.supersedes_memory_id:
+                previous = connection.execute(
+                    "SELECT user_id FROM memories WHERE memory_id=? AND deleted_at IS NULL",
+                    (memory.supersedes_memory_id,),
+                ).fetchone()
+                if previous is None or previous["user_id"] != user_id:
+                    raise ValueError("Superseded memory must exist and belong to the user")
+                connection.execute(
+                    "INSERT INTO memory_relations(source_memory_id, target_memory_id, "
+                    "relation_type, evidence_event_ids_json, created_at) VALUES (?, ?, "
+                    "'supersedes', ?, ?)",
+                    (
+                        memory_id,
+                        memory.supersedes_memory_id,
+                        json.dumps(evidence_ids),
+                        now,
+                    ),
+                )
+        self._embed_memory(memory_id, statement)
         return self.get_memory(memory_id)
 
     def get_memory(self, memory_id: str) -> MemoryRecord:
@@ -419,18 +464,73 @@ class MemoryStore:
                     "ORDER BY updated_at DESC LIMIT ?",
                     (user_id, f"%{query}%", limit),
                 ).fetchall()
-        return [
-            SearchHit(
-                record_type="memory",
-                record_id=row["memory_id"],
-                source=row["kind"],
-                text=row["statement"],
-                timestamp=row["updated_at"],
-                score=float(-row["rank"]),
-                metadata={"confidence": row["confidence"]},
+        query_vector = self._try_embed(query)
+        embedding_scores = self._embedding_scores(user_id, query_vector) if query_vector else {}
+        lexical = {row["memory_id"]: float(-row["rank"]) for row in rows}
+        candidate_ids = set(lexical) | set(embedding_scores)
+        if not candidate_ids:
+            return []
+        placeholders = ",".join("?" for _ in candidate_ids)
+        with self.storage.read_connection() as connection:
+            records = connection.execute(
+                "SELECT memory_id, statement, kind, updated_at, confidence, metadata_json "
+                "FROM memories WHERE user_id=? AND deleted_at IS NULL "
+                f"AND memory_id IN ({placeholders})",
+                [user_id, *candidate_ids],
+            ).fetchall()
+        lexical_max = max((abs(value) for value in lexical.values()), default=1.0) or 1.0
+        now = datetime.now(UTC)
+        hits: list[SearchHit] = []
+        for row in records:
+            metadata = json.loads(row["metadata_json"])
+            age_days = max(
+                0.0,
+                (now - datetime.fromisoformat(row["updated_at"]).astimezone(UTC)).total_seconds()
+                / 86_400,
             )
-            for row in rows
-        ]
+            recency = math.exp(-age_days / 180)
+            importance = {"high": 1.0, "medium": 0.6, "low": 0.2}.get(
+                str(metadata.get("importance", "medium")).casefold(), 0.6
+            )
+            lexical_score = max(0.0, lexical.get(row["memory_id"], 0.0) / lexical_max)
+            embedding_score = max(0.0, embedding_scores.get(row["memory_id"], 0.0))
+            relation = self._entity_relation_score(query, metadata)
+            if query_vector:
+                score = (
+                    lexical_score * 0.35
+                    + embedding_score * 0.35
+                    + recency * 0.1
+                    + importance * 0.08
+                    + float(row["confidence"]) * 0.07
+                    + relation * 0.05
+                )
+            else:
+                score = (
+                    lexical_score * 0.7
+                    + recency * 0.1
+                    + importance * 0.08
+                    + float(row["confidence"]) * 0.07
+                    + relation * 0.05
+                )
+            hits.append(
+                SearchHit(
+                    record_type="memory",
+                    record_id=row["memory_id"],
+                    source=row["kind"],
+                    text=row["statement"],
+                    timestamp=row["updated_at"],
+                    score=round(score, 6),
+                    metadata={
+                        "confidence": row["confidence"],
+                        "lexical_score": round(lexical_score, 6),
+                        "embedding_score": round(embedding_score, 6) if query_vector else None,
+                        "recency_score": round(recency, 6),
+                        "importance_score": importance,
+                        "entity_relation_score": relation,
+                    },
+                )
+            )
+        return sorted(hits, key=lambda item: (item.score, item.timestamp), reverse=True)[:limit]
 
     def personal_search(self, *, user_id: str, query: str, limit: int = 50) -> list[SearchHit]:
         memory_hits = self.search_memories(user_id=user_id, query=query, limit=limit)
@@ -475,6 +575,8 @@ class MemoryStore:
         )[:limit]
 
     def relevant_memories(self, *, user_id: str, text: str, limit: int = 5) -> list[SearchHit]:
+        if self.embedding_provider is not None:
+            return self.search_memories(user_id=user_id, query=text, limit=limit)
         match_query = _fts_trigram_or_query(text)
         if not match_query:
             return []
@@ -795,6 +897,81 @@ class MemoryStore:
         if count != len(unique_ids):
             raise ValueError("Memory evidence must reference existing events owned by the user")
 
+    def relations(self, memory_id: str) -> list[dict[str, Any]]:
+        with self.storage.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM memory_relations WHERE source_memory_id=? OR target_memory_id=? "
+                "ORDER BY created_at",
+                (memory_id, memory_id),
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["evidence_event_ids"] = json.loads(item.pop("evidence_event_ids_json"))
+            result.append(item)
+        return result
+
+    def _embed_memory(self, memory_id: str, statement: str) -> None:
+        if self.embedding_provider is None:
+            return
+        vector = self._try_embed(statement)
+        state = "ready" if vector else "failed"
+        with self.storage.transaction() as connection:
+            connection.execute(
+                "UPDATE memories SET embedding_state=? WHERE memory_id=?", (state, memory_id)
+            )
+            if vector:
+                connection.execute(
+                    "INSERT OR REPLACE INTO memory_embeddings(memory_id, model_id, vector_json, "
+                    "dimensions, created_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        memory_id,
+                        self.embedding_provider.model_id,
+                        json.dumps(vector),
+                        len(vector),
+                        utc_now(),
+                    ),
+                )
+
+    def _try_embed(self, text: str) -> list[float] | None:
+        if self.embedding_provider is None:
+            return None
+        try:
+            return self.embedding_provider.embed(text)
+        except Exception:
+            return None
+
+    def _embedding_scores(self, user_id: str, query_vector: list[float]) -> dict[str, float]:
+        with self.storage.read_connection() as connection:
+            rows = connection.execute(
+                "SELECT e.memory_id, e.vector_json FROM memory_embeddings e "
+                "JOIN memories m ON m.memory_id=e.memory_id "
+                "WHERE m.user_id=? AND m.deleted_at IS NULL AND e.model_id=? LIMIT 2000",
+                (user_id, self.embedding_provider.model_id if self.embedding_provider else ""),
+            ).fetchall()
+        result = {}
+        query_norm = math.sqrt(sum(value * value for value in query_vector))
+        if not query_norm:
+            return result
+        for row in rows:
+            vector = json.loads(row["vector_json"])
+            if len(vector) != len(query_vector):
+                continue
+            norm = math.sqrt(sum(float(value) * float(value) for value in vector))
+            if norm:
+                result[row["memory_id"]] = sum(
+                    left * float(right) for left, right in zip(query_vector, vector, strict=True)
+                ) / (query_norm * norm)
+        return result
+
+    @staticmethod
+    def _entity_relation_score(query: str, metadata: dict[str, Any]) -> float:
+        values = metadata.get("entities") or metadata.get("entity_ids") or []
+        if isinstance(values, str):
+            values = [values]
+        lowered = query.casefold()
+        return 1.0 if any(str(value).casefold() in lowered for value in values) else 0.0
+
     @staticmethod
     def _event_from_row(row: sqlite3.Row) -> EventRecord:
         return EventRecord(
@@ -825,6 +1002,7 @@ class MemoryStore:
             evidence_event_ids=json.loads(row["evidence_event_ids_json"]),
             retention_until=row["retention_until"],
             metadata=json.loads(row["metadata_json"]),
+            embedding_state=row["embedding_state"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )

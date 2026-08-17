@@ -6,7 +6,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any
@@ -24,7 +24,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, SecretStr
 
@@ -32,15 +32,20 @@ from .activity import ActivityCaptureService
 from .activity.models import ActivityBatch, ActivitySettingsUpdate
 from .audit import AuditLogger
 from .auth import auth_tools
+from .backup import EncryptedBackupService
 from .browser import BrowserWorkerClient, browser_tools
 from .browser_worker.models import BrowserProfile, TakeoverReleaseRequest
-from .calendar import CalendarStore, calendar_tools
+from .calendar import CalendarStore, CalendarSyncService, calendar_tools
 from .calendar.models import CalendarEventCreate, CalendarEventUpdate
+from .calendar.providers import GoogleCalendarProvider, LocalCalendarProvider
+from .coding import CodingService, coding_tools
+from .commerce import CommerceStore, commerce_tools
 from .communication import CommunicationService, CommunicationStore, communication_tools
 from .communication.models import CommunicationSource, NormalizedMessageCreate
 from .communication.service import LinePushAdapter, WorkerCommunicationAdapter
 from .computer import computer_tools
 from .config import Settings
+from .contacts import ContactCreate, ContactsStore, contact_tools
 from .core.service import AgentService, TaskNotResumable
 from .economic import EconomicStore, economic_tools
 from .evaluation import (
@@ -49,6 +54,7 @@ from .evaluation import (
     BenchmarkStore,
     load_default_suite,
 )
+from .execution import ExecutionStepStatus, ExecutionStore
 from .files import FileService, file_tools
 from .gateway.line import line_source_id, process_line_event, verify_signature
 from .home import HomeAssistantClient, home_tools
@@ -56,6 +62,7 @@ from .learning import LearningService, learning_tools
 from .line_desktop import LineDesktopBridgeClient
 from .line_desktop_bridge.models import SnapshotResponse
 from .memory import MemoryStore
+from .memory.embedding import LocalEmbeddingClient
 from .memory.models import (
     EntityCreate,
     EventCreate,
@@ -65,14 +72,22 @@ from .memory.models import (
     PreferenceUpsert,
 )
 from .memory.tools import memory_tools
-from .models.qwen import ModelClient, QwenClient
+from .models.qwen import ModelClient
+from .models.registry import LocalModelRouter
 from .observability import ObservabilityService
 from .personal_data import PersonalDataStore, personal_data_tools
+from .personal_data.models import (
+    DiaryCreate,
+    PersonalTodoCreate,
+    PersonalTodoUpdate,
+    TodoStatus,
+)
 from .policy.engine import PolicyEngine
 from .portability import DataPortabilityService, DeleteScope, export_json_bytes
 from .proactive import ProactiveService
 from .routing.deterministic import DeterministicRouter
 from .secret.models import SecretPutRequest
+from .secret.protection import protector_from_environment
 from .storage import Storage
 from .strong_auth import StrongAuthService
 from .strong_auth.service import StrongAuthRejected, StrongAuthUnavailable
@@ -132,6 +147,39 @@ class LearningDecisionRequest(BaseModel):
     accepted: bool
 
 
+class TodoSnoozeRequest(BaseModel):
+    until: datetime
+
+
+class CalendarSyncRequest(BaseModel):
+    provider: str = Field(min_length=1, max_length=100)
+
+
+class FilePathRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=8_000)
+    pages: list[int] | None = Field(default=None, max_length=500)
+
+
+class GoogleOAuthConnectRequest(BaseModel):
+    account_label: str = Field(default="Google", min_length=1, max_length=200)
+    scopes: list[str] = Field(
+        default_factory=lambda: [
+            "https://www.googleapis.com/auth/calendar",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.send",
+        ],
+        min_length=1,
+        max_length=10,
+    )
+
+
+class GmailAttachmentDownloadRequest(BaseModel):
+    message_id: str = Field(min_length=1, max_length=512)
+    attachment_id: str = Field(min_length=1, max_length=2_000)
+    filename: str = Field(min_length=1, max_length=500)
+    media_type: str = Field(default="application/octet-stream", max_length=500)
+
+
 class EndpointSecurity(StrEnum):
     LOCAL_ONLY = "LOCAL_ONLY"
     REMOTE_AUTHENTICATED = "REMOTE_AUTHENTICATED"
@@ -178,14 +226,29 @@ def endpoint_security(method: str, path: str) -> EndpointSecurity:
 class Runtime:
     def __init__(self, settings: Settings, model: ModelClient):
         self.settings = settings
+        self.model_registry = getattr(model, "registry", None)
         self.storage = Storage(settings.db_path)
         self.storage.initialize()
+        self.execution = ExecutionStore(self.storage)
+        self.execution.initialize()
+        self.execution_recovery = self.execution.recover_incomplete()
         self.recovered_tasks = self.storage.recover_incomplete_tasks()
         self.audit = AuditLogger(self.storage)
         self.strong_auth = StrongAuthService(self.storage, settings)
+        embedding = None
+        if settings.embedding_model_base_url and settings.embedding_model_name:
+            settings.validate_model_url(
+                settings.embedding_model_base_url,
+                variable="PERSONAL_AGENT_EMBEDDING_MODEL_BASE_URL",
+            )
+            embedding = LocalEmbeddingClient(
+                base_url=settings.embedding_model_base_url,
+                model_id=settings.embedding_model_name,
+            )
         self.memory = MemoryStore(
             self.storage,
             default_raw_retention_days=settings.raw_event_retention_days,
+            embedding_provider=embedding,
         )
         self.memory.initialize()
         self.learning = LearningService(self.storage, self.memory, user_id=settings.user_id)
@@ -198,14 +261,21 @@ class Runtime:
         )
         self.calendar = CalendarStore(self.storage, default_timezone=settings.timezone)
         self.calendar.initialize()
+        self.calendar_sync = CalendarSyncService(self.calendar)
+        self.calendar_sync.register(LocalCalendarProvider(self.calendar))
         self.economic = EconomicStore(self.storage)
         self.economic.initialize()
+        self.commerce = CommerceStore(self.storage)
+        self.commerce.initialize()
         self.personal_data = PersonalDataStore(
             self.storage,
             user_id=settings.user_id,
             timezone=settings.timezone,
         )
         self.personal_data.initialize()
+        self.contacts = ContactsStore(self.storage, user_id=settings.user_id)
+        self.contacts.initialize()
+        self.coding = CodingService(self.storage, settings)
         self.files = FileService(settings.files_roots, settings.files_trash_root)
         self.home = HomeAssistantClient(
             settings.home_assistant_url,
@@ -231,9 +301,7 @@ class Runtime:
                 access_token=settings.line_channel_access_token,
                 primary_user_id=settings.line_primary_user_id,
             )
-            self.communication.register(
-                self.line_push, scopes=["messages.read", "messages.write"]
-            )
+            self.communication.register(self.line_push, scopes=["messages.read", "messages.write"])
             self.storage.configure_notification_delivery(
                 provider="line", target=settings.line_primary_user_id
             )
@@ -252,6 +320,21 @@ class Runtime:
             self.communication.register(self.line_desktop, scopes=line_desktop_scopes)
             self.line_desktop_status["configured"] = True
         self.browser = BrowserWorkerClient(settings)
+        google_refs = (
+            settings.google_refresh_credential_id,
+            settings.google_client_id_credential_id,
+            settings.google_client_secret_credential_id,
+        )
+        if settings.browser_worker_token and all(google_refs):
+            self.calendar_sync.register(
+                GoogleCalendarProvider(
+                    self.browser,
+                    refresh_credential_id=settings.google_refresh_credential_id,
+                    client_id_credential_id=settings.google_client_id_credential_id,
+                    client_secret_credential_id=settings.google_client_secret_credential_id,
+                    calendar_id=settings.google_calendar_id,
+                )
+            )
         if settings.browser_worker_token and settings.slack_credential_id:
             self.communication.register(
                 WorkerCommunicationAdapter(
@@ -262,13 +345,24 @@ class Runtime:
                 ),
                 scopes=["messages.read", "messages.write"],
             )
-        if settings.browser_worker_token and settings.gmail_credential_id:
+        gmail_credential_id = settings.google_refresh_credential_id or settings.gmail_credential_id
+        if settings.browser_worker_token and gmail_credential_id:
             self.communication.register(
                 WorkerCommunicationAdapter(
                     source=CommunicationSource.EMAIL,
                     provider="gmail",
-                    credential_id=settings.gmail_credential_id,
+                    credential_id=gmail_credential_id,
                     worker=self.browser,
+                    oauth_client_id_credential_id=(
+                        settings.google_client_id_credential_id
+                        if settings.google_refresh_credential_id
+                        else None
+                    ),
+                    oauth_client_secret_credential_id=(
+                        settings.google_client_secret_credential_id
+                        if settings.google_refresh_credential_id
+                        else None
+                    ),
                 ),
                 scopes=["messages.read", "messages.write"],
             )
@@ -280,23 +374,29 @@ class Runtime:
             self.broker.register(definition)
         for definition in learning_tools(self.learning):
             self.broker.register(definition)
-        for definition in browser_tools(self.browser):
+        for definition in browser_tools(self.browser, model):
             self.broker.register(definition)
         for definition in auth_tools(self.browser):
             self.broker.register(definition)
         for definition in communication_tools(self.communication):
             self.broker.register(definition)
-        for definition in calendar_tools(self.calendar):
+        for definition in calendar_tools(self.calendar, self.calendar_sync):
             self.broker.register(definition)
         for definition in economic_tools(self.economic):
             self.broker.register(definition)
+        for definition in commerce_tools(self.commerce):
+            self.broker.register(definition)
         for definition in personal_data_tools(self.personal_data):
             self.broker.register(definition)
-        for definition in file_tools(self.files):
+        for definition in contact_tools(self.contacts):
+            self.broker.register(definition)
+        for definition in file_tools(self.files, model):
             self.broker.register(definition)
         for definition in home_tools(self.home):
             self.broker.register(definition)
-        for definition in computer_tools(self.storage):
+        for definition in computer_tools(self.storage, settings):
+            self.broker.register(definition)
+        for definition in coding_tools(self.coding):
             self.broker.register(definition)
         self.service = AgentService(
             storage=self.storage,
@@ -307,6 +407,8 @@ class Runtime:
             memory=self.memory,
             user_id=settings.user_id,
             timezone=settings.timezone,
+            execution=self.execution,
+            task_cancel_handlers=(self.coding.cancel_task,),
         )
         self.benchmark_store = BenchmarkStore(self.storage)
         self.benchmark_store.initialize()
@@ -317,8 +419,10 @@ class Runtime:
             "communication",
             "memory",
             "economic",
+            "commerce",
             "personal_todo",
             "diary",
+            "contacts",
             "scheduler",
             "proactive",
         }
@@ -360,9 +464,7 @@ async def deliver_line_notification_once(runtime: Runtime) -> bool:
             text=str(delivery["text"]),
             thread_id=None,
             reply_to=None,
-            idempotency_key=(
-                f"notification:{delivery['notification_id']}:line:{target}"
-            ),
+            idempotency_key=(f"notification:{delivery['notification_id']}:line:{target}"),
             task_id=str(delivery["task_id"]),
             action_id=delivery_id,
         )
@@ -449,9 +551,7 @@ async def sync_line_desktop_once(runtime: Runtime) -> dict[str, Any]:
     return result
 
 
-def ingest_line_desktop_snapshot(
-    runtime: Runtime, snapshot: SnapshotResponse
-) -> dict[str, Any]:
+def ingest_line_desktop_snapshot(runtime: Runtime, snapshot: SnapshotResponse) -> dict[str, Any]:
     messages = [
         LineDesktopBridgeClient.normalized_message(item.model_dump(mode="json"))
         for item in snapshot.messages
@@ -487,7 +587,7 @@ def create_app(
     configured = settings or Settings.from_env()
     configured.validate_bind_host()
     configured.validate_remote_bind_security()
-    model = model_client or QwenClient(configured)
+    model = model_client or LocalModelRouter.from_settings(configured)
     runtime = Runtime(configured, model)
 
     async def retention_loop() -> None:
@@ -552,11 +652,110 @@ def create_app(
                     },
                 )
 
+    async def backup_loop() -> None:
+        assert configured.backup_root is not None
+        while True:
+            try:
+                service = EncryptedBackupService(protector_from_environment())
+                result = await asyncio.to_thread(
+                    service.create_automated,
+                    configured.db_path,
+                    configured.backup_root,
+                    retention_count=configured.backup_retention_count,
+                    retention_days=configured.backup_retention_days,
+                )
+                runtime.audit.record(
+                    task_id=None,
+                    actor="scheduler",
+                    action="backup.automated",
+                    result="ok",
+                    details={
+                        "destination": result["destination"],
+                        "verified": result["verification"]["verified"],
+                        "pruned_count": len(result["pruned"]),
+                    },
+                )
+            except Exception as exc:
+                runtime.audit.record(
+                    task_id=None,
+                    actor="scheduler",
+                    action="backup.automated",
+                    result="failed",
+                    details={"reason_code": type(exc).__name__},
+                )
+            await asyncio.sleep(max(1, configured.backup_interval_hours) * 3600)
+
     async def line_notification_loop() -> None:
         while True:
             handled = await deliver_line_notification_once(runtime)
             if not handled:
                 await asyncio.sleep(1)
+
+    async def coding_job_loop() -> None:
+        while True:
+            try:
+                runtime.coding.refresh_jobs()
+            except Exception as exc:
+                runtime.audit.record(
+                    task_id=None,
+                    actor="scheduler",
+                    action="coding.refresh",
+                    result="failed",
+                    details={"reason_code": type(exc).__name__},
+                )
+            for job in runtime.coding.pending_notifications():
+                try:
+                    job_status = str(job["status"])
+                    current_task = runtime.storage.get_task(str(job["task_id"]))
+                    if current_task.state is TaskState.CANCELLED:
+                        runtime.coding.cancel_task(current_task.task_id)
+                        runtime.coding.schedule_completion_notification(job)
+                        continue
+                    step_id = job.get("step_id")
+                    if step_id:
+                        step_status = (
+                            ExecutionStepStatus.COMPLETED
+                            if job_status == "completed"
+                            else ExecutionStepStatus.SUBMITTED_UNKNOWN
+                            if job_status == "submitted_unknown"
+                            else ExecutionStepStatus.FAILED
+                        )
+                        runtime.execution.set_status(
+                            str(job["task_id"]),
+                            str(step_id),
+                            step_status,
+                            evidence={"coding_job_id": job["job_id"], "status": job_status},
+                        )
+                    has_remaining = any(
+                        step.status is not ExecutionStepStatus.COMPLETED
+                        for step in runtime.execution.steps(str(job["task_id"]))
+                    )
+                    task_state = (
+                        (TaskState.PAUSED if has_remaining else TaskState.COMPLETED)
+                        if job_status == "completed"
+                        else TaskState.SUBMITTED_UNKNOWN
+                        if job_status == "submitted_unknown"
+                        else TaskState.FAILED
+                    )
+                    runtime.storage.update_task(
+                        str(job["task_id"]),
+                        state=task_state,
+                        result={"coding_job_id": job["job_id"], "status": job_status},
+                        event_type="coding_job_finished",
+                    )
+                    runtime.coding.schedule_completion_notification(job)
+                except Exception as exc:
+                    runtime.audit.record(
+                        task_id=str(job.get("task_id") or "") or None,
+                        actor="scheduler",
+                        action="coding.completion",
+                        result="failed",
+                        details={
+                            "coding_job_id": job.get("job_id"),
+                            "reason_code": type(exc).__name__,
+                        },
+                    )
+            await asyncio.sleep(2)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -564,9 +763,12 @@ def create_app(
         background_tasks = [
             asyncio.create_task(retention_loop()),
             asyncio.create_task(proactive_loop()),
+            asyncio.create_task(coding_job_loop()),
         ]
         if runtime.line_push is not None:
             background_tasks.append(asyncio.create_task(line_notification_loop()))
+        if configured.backup_root is not None:
+            background_tasks.append(asyncio.create_task(backup_loop()))
         try:
             yield
         finally:
@@ -676,8 +878,7 @@ def create_app(
 
     def is_trusted_tls_proxy(connection: Request | WebSocket) -> bool:
         return is_loopback_connection(connection) and (
-            connection.headers.get("X-Personal-Agent-Remote-Proxy")
-            == "tailscale-direct-tls-v1"
+            connection.headers.get("X-Personal-Agent-Remote-Proxy") == "tailscale-direct-tls-v1"
         )
 
     def is_trusted_tailscale_serve(connection: Request | WebSocket) -> bool:
@@ -766,17 +967,12 @@ def create_app(
                 )
             elif security_class is EndpointSecurity.WORKER_TOKEN:
                 response = await call_next(request)
-            elif (
-                (identity := trusted_remote_identity(request)) is None
-            ):
+            elif (identity := trusted_remote_identity(request)) is None:
                 response = JSONResponse(
                     status_code=status.HTTP_403_FORBIDDEN,
                     content={"detail": "A trusted Tailscale identity is required"},
                 )
-            elif (
-                not configured.require_remote_passkey
-                or not configured.webauthn_rp_id
-            ):
+            elif not configured.require_remote_passkey or not configured.webauthn_rp_id:
                 response = JSONResponse(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     content={"detail": "Remote passkey enforcement is not safely configured"},
@@ -833,6 +1029,14 @@ def create_app(
     @app.get("/api/system/health", dependencies=[Depends(require_admin)])
     async def system_health() -> dict[str, Any]:
         return runtime.observability.health()
+
+    @app.get("/api/models", dependencies=[Depends(require_admin)])
+    async def models() -> dict[str, Any]:
+        return (
+            runtime.model_registry.snapshot()
+            if runtime.model_registry
+            else {"custom": {"model_id": str(getattr(model, "model", type(model).__name__))}}
+        )
 
     @app.get("/api/metrics", dependencies=[Depends(require_admin)])
     async def metrics() -> dict[str, Any]:
@@ -1177,9 +1381,7 @@ def create_app(
         if status_payload.get("last_sync_at"):
             try:
                 last_sync = datetime.fromisoformat(str(status_payload["last_sync_at"]))
-                last_sync_age_seconds = max(
-                    0, int((datetime.now(UTC) - last_sync).total_seconds())
-                )
+                last_sync_age_seconds = max(0, int((datetime.now(UTC) - last_sync).total_seconds()))
                 if last_sync_age_seconds <= configured.line_desktop_sync_interval_seconds * 3:
                     bridge_status = "ok"
                 else:
@@ -1217,6 +1419,127 @@ def create_app(
     @app.get("/api/tasks")
     async def tasks(limit: int = Query(100, ge=1, le=500)) -> list[dict[str, Any]]:
         return [task.model_dump(mode="json") for task in runtime.storage.list_tasks(limit=limit)]
+
+    @app.get("/api/today")
+    async def today() -> dict[str, Any]:
+        local_now = datetime.now(runtime.service.timezone)
+        day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day_end = day_start + timedelta(days=1)
+        todos = runtime.personal_data.list_todos(status=TodoStatus.OPEN, limit=500)
+        return {
+            "date": local_now.date().isoformat(),
+            "timezone": str(runtime.service.timezone),
+            "calendar": [
+                item.model_dump(mode="json")
+                for item in runtime.calendar.search(
+                    query=None,
+                    start_at=day_start,
+                    end_at=day_end,
+                    limit=500,
+                )
+            ],
+            "must": [
+                item.model_dump(mode="json") for item in todos if item.todo_type.value == "must"
+            ],
+            "want": [
+                item.model_dump(mode="json") for item in todos if item.todo_type.value == "want"
+            ],
+            "reminders": [
+                item
+                for item in runtime.storage.list_scheduled_jobs()
+                if item["status"] == "scheduled" and item["run_at"] < day_end.isoformat()
+            ],
+            "suggestions": runtime.proactive.list(state="open", limit=20),
+            "generated_at": local_now.isoformat(),
+        }
+
+    @app.get("/api/todos")
+    async def todos(
+        todo_status: Annotated[TodoStatus | None, Query(alias="status")] = TodoStatus.OPEN,
+        limit: int = Query(default=200, ge=1, le=1_000),
+    ) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json")
+            for item in runtime.personal_data.list_todos(status=todo_status, limit=limit)
+        ]
+
+    @app.post("/api/todos")
+    async def create_todo(value: PersonalTodoCreate) -> dict[str, Any]:
+        result = runtime.personal_data.create_todo(value)
+        runtime.audit.record(
+            task_id=result.source_task_id,
+            actor="primary_user:web",
+            action="todo.create",
+            result="ok",
+            details={"todo_id": result.todo_id, "reminder_scheduled": bool(result.remind_at)},
+        )
+        return result.model_dump(mode="json")
+
+    @app.patch("/api/todos/{todo_id}")
+    async def update_todo(todo_id: str, value: PersonalTodoUpdate) -> dict[str, Any]:
+        result = runtime.personal_data.update_todo(todo_id, value)
+        return result.model_dump(mode="json")
+
+    @app.post("/api/todos/{todo_id}/complete")
+    async def complete_todo(todo_id: str) -> dict[str, Any]:
+        return runtime.personal_data.complete_todo(todo_id).model_dump(mode="json")
+
+    @app.post("/api/todos/{todo_id}/snooze")
+    async def snooze_todo(todo_id: str, request: TodoSnoozeRequest) -> dict[str, Any]:
+        return runtime.personal_data.snooze_todo(todo_id, until=request.until).model_dump(
+            mode="json"
+        )
+
+    @app.delete("/api/todos/{todo_id}")
+    async def delete_todo(todo_id: str) -> dict[str, Any]:
+        return runtime.personal_data.delete_todo(todo_id)
+
+    @app.get("/api/diary")
+    async def diary_entries(
+        entry_date: Annotated[date | None, Query(alias="date")] = None,
+        q: str | None = Query(default=None, max_length=2_000),
+    ) -> list[dict[str, Any]]:
+        entries = (
+            runtime.personal_data.search_diary(q, limit=200)
+            if q
+            else runtime.personal_data.read_diary(entry_date)
+        )
+        return [item.model_dump(mode="json") for item in entries]
+
+    @app.post("/api/diary")
+    async def create_diary_entry(value: DiaryCreate) -> dict[str, Any]:
+        return runtime.personal_data.create_diary(value).model_dump(mode="json")
+
+    @app.get("/api/inbox")
+    async def inbox(limit: int = Query(default=100, ge=1, le=500)) -> list[dict[str, Any]]:
+        return [
+            item.model_dump(mode="json") for item in runtime.communication_store.recent(limit=limit)
+        ]
+
+    @app.get("/api/contacts")
+    async def contacts(
+        q: str = Query(default="", max_length=2_000),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, Any]]:
+        records = (
+            runtime.contacts.search(q, limit=limit)
+            if q.strip()
+            else runtime.contacts.list(limit=limit)
+        )
+        return [item.model_dump(mode="json") for item in records]
+
+    @app.post("/api/contacts")
+    async def create_contact(value: ContactCreate) -> dict[str, Any]:
+        return runtime.contacts.upsert(value).model_dump(mode="json")
+
+    @app.get("/api/contacts/resolve")
+    async def resolve_contact(
+        q: str = Query(min_length=1, max_length=2_000),
+        destination_kind: str | None = Query(default=None, max_length=100),
+    ) -> dict[str, Any]:
+        return runtime.contacts.resolve(q, destination_kind=destination_kind).model_dump(
+            mode="json"
+        )
 
     @app.post("/api/communication/messages", dependencies=[Depends(require_admin)])
     async def ingest_communication(message: NormalizedMessageCreate) -> dict[str, bool]:
@@ -1312,6 +1635,122 @@ def create_app(
             for item in runtime.communication_store.connectors()
         ]
 
+    @app.post(
+        "/api/connectors/google/oauth/start",
+        dependencies=[Depends(require_passkey)],
+    )
+    async def start_google_oauth(request: GoogleOAuthConnectRequest) -> dict[str, Any]:
+        required = {
+            "browser_worker": configured.browser_worker_token,
+            "client_id": configured.google_client_id_credential_id,
+            "client_secret": configured.google_client_secret_credential_id,
+            "refresh_target": configured.google_refresh_credential_id,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Google OAuth configuration is incomplete: {', '.join(missing)}",
+            )
+        origin = configured.webauthn_origin or f"http://127.0.0.1:{configured.port}"
+        redirect_uri = f"{origin}/api/connectors/google/oauth/callback"
+        task = runtime.storage.create_task(
+            user_id=configured.user_id,
+            goal="Authorize Google Calendar and Gmail",
+            source=TaskChannel.WEB,
+            conversation_id="pwa-primary",
+            risk_level=RiskLevel.R1,
+        )
+        result = await runtime.browser.google_oauth_start(
+            task_id=task.task_id,
+            client_id_credential_id=configured.google_client_id_credential_id,
+            client_secret_credential_id=configured.google_client_secret_credential_id,
+            refresh_credential_id=configured.google_refresh_credential_id,
+            redirect_uri=redirect_uri,
+            scopes=request.scopes,
+            account_label=request.account_label,
+        )
+        runtime.storage.update_task(
+            task.task_id,
+            state=TaskState.WAITING_USER,
+            result={"oauth": "authorization_required", "scopes": result.get("scopes", [])},
+            event_type="google_oauth_authorization_required",
+        )
+        return {**result, "task_id": task.task_id, "redirect_uri": redirect_uri}
+
+    @app.get(
+        "/api/connectors/google/oauth/callback",
+        response_class=HTMLResponse,
+        dependencies=[Depends(require_passkey)],
+    )
+    async def finish_google_oauth(
+        code: str = Query(min_length=1, max_length=8_000),
+        state: str = Query(min_length=32, max_length=512),
+    ) -> HTMLResponse:
+        result = await runtime.browser.google_oauth_exchange(state=state, code=code)
+        task_id = str(result.get("task_id") or "")
+        if task_id:
+            runtime.storage.update_task(
+                task_id,
+                state=TaskState.COMPLETED,
+                result={
+                    "provider": "google",
+                    "connected": True,
+                    "scopes": result.get("scopes", []),
+                    "refresh_token_exposed": False,
+                },
+                event_type="google_oauth_connected",
+            )
+        return HTMLResponse(
+            "<!doctype html><html lang='ja'><meta charset='utf-8'>"
+            "<title>Google connected</title><body><h1>Google連携が完了しました</h1>"
+            "<p>Refresh tokenはSecret Workerへ暗号化保存され、CoreやLLMには表示されません。"
+            "このタブを閉じてPersonal Agentへ戻れます。</p></body></html>"
+        )
+
+    @app.post(
+        "/api/communication/gmail/attachments/download",
+        dependencies=[Depends(require_admin)],
+    )
+    async def download_gmail_attachment(
+        request: GmailAttachmentDownloadRequest,
+    ) -> dict[str, Any]:
+        refs = {
+            "refresh": configured.google_refresh_credential_id,
+            "client_id": configured.google_client_id_credential_id,
+            "client_secret": configured.google_client_secret_credential_id,
+        }
+        missing = [name for name, value in refs.items() if not value]
+        if missing:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Google OAuth configuration is incomplete: {', '.join(missing)}",
+            )
+        task = runtime.storage.create_task(
+            user_id=configured.user_id,
+            goal=f"Quarantine Gmail attachment {request.filename}",
+            source=TaskChannel.WEB,
+            conversation_id="pwa-primary",
+            risk_level=RiskLevel.R1,
+        )
+        result = await runtime.browser.gmail_attachment(
+            refresh_credential_id=refs["refresh"],
+            client_id_credential_id=refs["client_id"],
+            client_secret_credential_id=refs["client_secret"],
+            task_id=task.task_id,
+            message_id=request.message_id,
+            attachment_id=request.attachment_id,
+            filename=request.filename,
+            media_type=request.media_type,
+        )
+        runtime.storage.update_task(
+            task.task_id,
+            state=TaskState.COMPLETED,
+            result=result,
+            event_type="gmail_attachment_quarantined",
+        )
+        return {**result, "task_id": task.task_id}
+
     @app.put("/api/connectors/{provider}", dependencies=[Depends(require_admin)])
     async def update_connector(
         provider: CommunicationSource, update: ConnectorUpdate
@@ -1371,6 +1810,7 @@ def create_app(
     async def task_detail(task_id: str) -> dict[str, Any]:
         return {
             "task": runtime.storage.get_task(task_id).model_dump(mode="json"),
+            "steps": [step.model_dump(mode="json") for step in runtime.execution.steps(task_id)],
             "events": [
                 event.model_dump(mode="json") for event in runtime.storage.list_task_events(task_id)
             ],
@@ -1422,6 +1862,37 @@ def create_app(
     async def cancel_calendar_event(event_id: str) -> dict[str, Any]:
         return runtime.calendar.cancel(event_id).model_dump(mode="json")
 
+    @app.get("/api/calendar/providers")
+    async def calendar_providers() -> list[dict[str, Any]]:
+        return runtime.calendar_sync.status()
+
+    @app.post("/api/calendar/sync", dependencies=[Depends(require_admin)])
+    async def sync_calendar(request: CalendarSyncRequest) -> dict[str, Any]:
+        task = runtime.storage.create_task(
+            user_id=configured.user_id,
+            goal=f"Sync {request.provider} calendar",
+            source=TaskChannel.WEB,
+            conversation_id="pwa-primary",
+            risk_level=RiskLevel.R1,
+        )
+        try:
+            result = await runtime.calendar_sync.sync(request.provider, task_id=task.task_id)
+        except Exception as exc:
+            runtime.storage.update_task(
+                task.task_id,
+                state=TaskState.WAITING_EXTERNAL,
+                error=f"{type(exc).__name__}: {exc}",
+                event_type="calendar_sync_failed",
+            )
+            raise
+        runtime.storage.update_task(
+            task.task_id,
+            state=TaskState.COMPLETED,
+            result=result,
+            event_type="calendar_sync_completed",
+        )
+        return result
+
     @app.get("/api/economic/intents", dependencies=[Depends(require_admin)])
     async def economic_intents(
         limit: int = Query(default=200, ge=1, le=1_000),
@@ -1453,6 +1924,27 @@ def create_app(
             "roots": [str(root) for root in runtime.files.roots],
             "trash_root": str(runtime.files.trash_root),
         }
+
+    @app.get("/api/files/recent", dependencies=[Depends(require_admin)])
+    async def recent_files(
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, object]]:
+        return runtime.files.recent(limit=limit)
+
+    @app.get("/api/files/search", dependencies=[Depends(require_admin)])
+    async def search_files(
+        q: str = Query(min_length=1, max_length=2_000),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> list[dict[str, object]]:
+        return runtime.files.search(q, limit=limit)
+
+    @app.post("/api/files/inspect", dependencies=[Depends(require_admin)])
+    async def inspect_file(request: FilePathRequest) -> dict[str, object]:
+        return runtime.files.inspect(request.path)
+
+    @app.post("/api/files/extract-text", dependencies=[Depends(require_admin)])
+    async def extract_file_text(request: FilePathRequest) -> dict[str, object]:
+        return runtime.files.extract_text(request.path, pages=request.pages)
 
     @app.get("/api/home/status", dependencies=[Depends(require_admin)])
     async def home_status() -> dict[str, Any]:

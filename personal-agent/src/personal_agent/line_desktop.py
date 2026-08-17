@@ -37,9 +37,7 @@ class LineDesktopBridgeClient:
 
     async def snapshot(self) -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=self.timeout, transport=self.transport) as client:
-            response = await client.post(
-                f"{self.base_url}/snapshot", headers=self.headers, json={}
-            )
+            response = await client.post(f"{self.base_url}/snapshot", headers=self.headers, json={})
             response.raise_for_status()
             return response.json()
 
@@ -110,7 +108,6 @@ class LineDesktopBridgeClient:
             text=text,
             permissions=["messages.read"],
             source_reference=str(
-                item.get("source_reference")
-                or f"line-desktop://{conversation_id}/{message_id}"
+                item.get("source_reference") or f"line-desktop://{conversation_id}/{message_id}"
             ),
         )
