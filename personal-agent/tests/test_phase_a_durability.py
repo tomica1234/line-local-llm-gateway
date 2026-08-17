@@ -19,6 +19,53 @@ class OpaqueArgs(BaseModel):
     draft_id: str
 
 
+@pytest.mark.parametrize(
+    ("action_type", "before", "after"),
+    [
+        (
+            "communication.send",
+            {"recipient_actual_address": "first@example.test", "body": "hello"},
+            {"recipient_actual_address": "changed@example.test", "body": "hello"},
+        ),
+        (
+            "economic.execute_sandbox",
+            {"item": "hotel", "total": "11000", "currency": "JPY"},
+            {"item": "hotel", "total": "12000", "currency": "JPY"},
+        ),
+        (
+            "browser.submit",
+            {
+                "origin": "https://booking.example",
+                "submit_target": "Reserve",
+                "nonsecret_inputs": {"guest": "A"},
+            },
+            {
+                "origin": "https://booking.example",
+                "submit_target": "Reserve now",
+                "nonsecret_inputs": {"guest": "B"},
+            },
+        ),
+    ],
+)
+def test_recipient_price_and_browser_submit_changes_alter_approval_material_hash(
+    action_type: str, before: dict[str, object], after: dict[str, object]
+) -> None:
+    original = ApprovalMaterial.create(
+        action_type=action_type,
+        title="Approval regression",
+        human_summary="Approve the exact displayed material once.",
+        structured_payload=before,
+    )
+    changed = ApprovalMaterial.create(
+        action_type=action_type,
+        title="Approval regression",
+        human_summary="Approve the exact displayed material once.",
+        structured_payload=after,
+    )
+
+    assert original.material_hash != changed.material_hash
+
+
 @pytest.mark.asyncio
 async def test_approval_material_change_invalidates_approval_before_execution(
     tmp_path: Path,
@@ -137,3 +184,57 @@ def test_restart_recovery_never_retries_inflight_mutation(tmp_path: Path) -> Non
     assert recovered == {"resumable": 0, "submitted_unknown": 1}
     assert execution.steps(task.task_id)[0].status is ExecutionStepStatus.SUBMITTED_UNKNOWN
     assert storage.get_task(task.task_id).state is TaskState.SUBMITTED_UNKNOWN
+
+
+def test_restart_recovers_running_read_but_never_reopens_completed_step(tmp_path: Path) -> None:
+    storage = Storage(tmp_path / "read-recovery.sqlite3")
+    storage.initialize()
+    execution = ExecutionStore(storage)
+    execution.initialize()
+    task = storage.create_task(
+        user_id="primary",
+        goal="read safely",
+        source=Channel.WEB,
+        conversation_id="test",
+    )
+    read = CapabilityStep(
+        step_id="read",
+        purpose="read local state",
+        allowed_tools=frozenset({"todo.list"}),
+        permissions=frozenset({"todo.read"}),
+        risk=RiskLevel.R0,
+    )
+    completed = CapabilityStep(
+        step_id="done",
+        purpose="already complete",
+        allowed_tools=frozenset(),
+        permissions=frozenset(),
+        risk=RiskLevel.R0,
+    )
+    execution.ensure_plan(
+        task_id=task.task_id,
+        goal=task.goal,
+        steps=(read, completed),
+        model="local-test",
+        prompt_version="v1",
+    )
+    execution.start_step(task.task_id, read.step_id, input_data={})
+    execution.start_step(task.task_id, completed.step_id, input_data={})
+    execution.set_status(
+        task.task_id,
+        completed.step_id,
+        ExecutionStepStatus.COMPLETED,
+        output={"value": "durable"},
+    )
+
+    recovered = ExecutionStore(storage).recover_incomplete()
+    records = {step.step_id: step for step in execution.steps(task.task_id)}
+
+    assert recovered == {"resumable": 1, "submitted_unknown": 0}
+    assert records["read"].status is ExecutionStepStatus.PENDING
+    assert records["done"].status is ExecutionStepStatus.COMPLETED
+    assert records["done"].output == {"value": "durable"}
+    execution.start_step(task.task_id, completed.step_id, input_data={"must": "not overwrite"})
+    unchanged = {step.step_id: step for step in execution.steps(task.task_id)}["done"]
+    assert unchanged.status is ExecutionStepStatus.COMPLETED
+    assert unchanged.output == {"value": "durable"}

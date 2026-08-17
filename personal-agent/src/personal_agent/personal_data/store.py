@@ -203,9 +203,10 @@ class PersonalDataStore:
         current = self.get_todo(todo_id)
         values = update.model_dump(exclude_unset=True, mode="json")
         if "recurrence" in values:
+            recurrence_value = values.pop("recurrence")
             values["recurrence_json"] = (
-                json.dumps(values.pop("recurrence"), ensure_ascii=False)
-                if values["recurrence"] is not None
+                json.dumps(recurrence_value, ensure_ascii=False)
+                if recurrence_value is not None
                 else None
             )
         if (

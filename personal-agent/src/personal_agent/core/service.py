@@ -12,6 +12,7 @@ from ..memory.models import EventCreate, TrustLevel
 from ..memory.sanitizer import sanitize_text
 from ..memory.store import MemoryStore
 from ..models.qwen import ModelClient, ModelTurn
+from ..models.registry import classify_request_purpose
 from ..routing.deterministic import DeterministicRouter, Intent, RouteDecision
 from ..storage import Storage
 from ..tool_broker.broker import ToolBroker
@@ -710,7 +711,13 @@ class AgentService:
         capability_plan = capability_plan or build_capability_plan(task.goal)
         complete_with_tools = getattr(self.model, "complete_with_tools", None)
         if not capability_plan or complete_with_tools is None:
-            response = await self.model.complete(messages)
+            purpose = classify_request_purpose(task.goal, has_tools=bool(capability_plan))
+            purpose_complete = getattr(self.model, "complete_for", None)
+            response = (
+                await purpose_complete(messages, purpose=purpose)
+                if callable(purpose_complete)
+                else await self.model.complete(messages)
+            )
             if not response:
                 raise RuntimeError("Local model returned an empty response")
             return response, {
@@ -719,6 +726,7 @@ class AgentService:
                 "external_action_performed": False,
                 "memory_ids": [hit.record_id for hit in relevant_memories],
                 "tools_presented": [],
+                "model_request_purpose": purpose.value,
             }
 
         tool_evidence: list[dict[str, object]] = []

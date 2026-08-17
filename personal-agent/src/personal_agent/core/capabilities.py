@@ -396,7 +396,7 @@ def build_capability_plan(goal: str) -> tuple[CapabilityStep, ...]:
         )
     if _matches(goal, r"clipboard|クリップボード"):
         permissions = {"computer.clipboard.read"}
-        tools = {"computer.clipboard.read"}
+        tools = {"computer.clipboard.metadata", "computer.clipboard.read"}
         if _matches(goal, r"書|貼|入れて|write"):
             permissions.add("computer.clipboard.write")
             tools.add("computer.clipboard.write")

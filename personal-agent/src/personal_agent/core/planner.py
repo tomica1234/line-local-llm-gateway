@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ..models.qwen import ModelClient
+from ..models.registry import ModelRequestPurpose
 from ..types import RiskLevel
 from .capabilities import CapabilityStep, build_capability_plan
 
@@ -110,7 +111,13 @@ class LLMCapabilityPlanner:
             f"ユーザー原文: {json.dumps(goal, ensure_ascii=False)}"
         )
         try:
-            response = await self.model.complete([{"role": "user", "content": prompt}])
+            messages = [{"role": "user", "content": prompt}]
+            purpose_complete = getattr(self.model, "complete_for", None)
+            response = (
+                await purpose_complete(messages, purpose=ModelRequestPurpose.PLANNING)
+                if callable(purpose_complete)
+                else await self.model.complete(messages)
+            )
             proposal = CapabilityProposal.model_validate(json.loads(_json_object(response)))
             validated = self.validator.validate(goal, proposal)
             return validated, {

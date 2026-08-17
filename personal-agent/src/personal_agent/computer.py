@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import os
 import platform
+import re
 import signal
 import subprocess
 import uuid
@@ -98,7 +100,20 @@ class DesktopTypeArgs(BaseModel):
     def reject_secret_target(self) -> DesktopTypeArgs:
         if any(
             marker in self.target.casefold()
-            for marker in ("password", "パスワード", "otp", "認証コード", "card", "cvv")
+            for marker in (
+                "password",
+                "パスワード",
+                "otp",
+                "認証コード",
+                "security code",
+                "secret",
+                "token",
+                "api key",
+                "card",
+                "カード",
+                "cvv",
+                "cvc",
+            )
         ):
             raise ValueError("Secret desktop fields must use Secret Worker, not desktop.type")
         return self
@@ -236,23 +251,94 @@ class ComputerService:
         self._set_job_status(job_id, "cancelled")
         return self.job(job_id)
 
+    @classmethod
+    def clipboard_metadata(cls) -> dict[str, Any]:
+        try:
+            text = cls._clipboard_get()
+        except Exception:
+            return {
+                "available": False,
+                "chars": 0,
+                "content_type": "unavailable",
+                "secret_like": False,
+            }
+        return cls._clipboard_text_metadata(text)
+
+    @classmethod
+    def clipboard_read(cls) -> dict[str, Any]:
+        text = cls._clipboard_get()
+        metadata = cls._clipboard_text_metadata(text)
+        bounded = text[:20_000]
+        return {
+            **metadata,
+            "text": ("[REDACTED_SECRET_LIKE_CLIPBOARD]" if metadata["secret_like"] else bounded),
+            "redacted": metadata["secret_like"],
+            "truncated": len(text) > len(bounded),
+        }
+
     @staticmethod
-    def clipboard_read() -> dict[str, Any]:
-        text = ComputerService._clipboard_get()[:20_000]
-        secret_like = any(
-            marker in text.casefold()
-            for marker in (
-                "password",
-                "api_key",
-                "secret://",
-                "BEGIN PRIVATE KEY".casefold(),  # pragma: allowlist secret
-            )
+    def _clipboard_text_metadata(text: str) -> dict[str, Any]:
+        stripped = text.strip()
+        content_type = (
+            "empty"
+            if not stripped
+            else "application/json"
+            if stripped[:1] in {"{", "["} and stripped[-1:] in {"}", "]"}
+            else "text/plain"
         )
         return {
-            "text": "[REDACTED_SECRET_LIKE_CLIPBOARD]" if secret_like else text,
-            "redacted": secret_like,
-            "truncated": len(text) >= 20_000,
+            "available": True,
+            "chars": len(text),
+            "content_type": content_type,
+            "secret_like": ComputerService._looks_secret_like(text),
         }
+
+    @staticmethod
+    def _looks_secret_like(text: str) -> bool:
+        if not text:
+            return False
+        direct_patterns = (
+            r"(?i)-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----",
+            r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}",
+            r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b",
+            r"\bgh(?:p|o|u|s|r)_[A-Za-z0-9]{30,}\b",
+            r"\bgithub_pat_[A-Za-z0-9_]{50,}\b",
+            r"\bsk-[A-Za-z0-9_-]{20,}\b",
+            r"(?i)\b(?:api[_ -]?key|access[_ -]?token|client[_ -]?secret|password)\s*[:=]\s*\S{8,}",
+            r"(?i)https?://[^\s/:@]+:[^\s/@]+@[^\s/]+",
+            r"(?i)\b(?:otp|one[ -]?time|verification code|認証コード)\s*[:=：]?\s*\d{4,8}\b",
+            r"secret://[a-z0-9][a-z0-9._/-]{2,200}",
+        )
+        if any(re.search(pattern, text) for pattern in direct_patterns):
+            return True
+        for candidate in re.findall(
+            r"(?<![A-Za-z0-9])[A-Za-z0-9_+/=-]{32,256}(?![A-Za-z0-9])", text
+        ):
+            if re.fullmatch(
+                r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-"
+                r"[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+                candidate,
+            ):
+                continue
+            entropy = ComputerService._entropy(candidate)
+            if re.fullmatch(r"[0-9a-fA-F]{48,}", candidate) and entropy >= 3.5:
+                return True
+            classes = sum(
+                bool(re.search(pattern, candidate))
+                for pattern in (r"[a-z]", r"[A-Z]", r"[0-9]", r"[_+/=-]")
+            )
+            if classes >= 3 and entropy >= 4.0:
+                return True
+        return False
+
+    @staticmethod
+    def _entropy(value: str) -> float:
+        if not value:
+            return 0.0
+        return -sum(
+            (count / len(value)) * math.log2(count / len(value))
+            for count in (value.count(character) for character in set(value))
+        )
 
     @staticmethod
     def clipboard_write(text: str) -> dict[str, Any]:
@@ -285,13 +371,36 @@ class ComputerService:
     def desktop_type(text: str, target: str) -> dict[str, Any]:
         if os.name != "nt":
             raise RuntimeError("Desktop automation is only available on Windows")
-        ComputerService._clipboard_set(text)
+        original = ComputerService._clipboard_get()
+        restored = False
+        restore_warning: str | None = None
+        try:
+            ComputerService._clipboard_set(text)
+            ComputerService._paste_from_clipboard()
+        finally:
+            try:
+                ComputerService._clipboard_set(original)
+                restored = True
+            except Exception:
+                restore_warning = "CLIPBOARD_RESTORE_FAILED"
+            original = ""
+        result: dict[str, Any] = {
+            "target": target,
+            "typed_characters": len(text),
+            "value_recorded": False,
+            "clipboard_restored": restored,
+        }
+        if restore_warning:
+            result["warnings"] = [restore_warning]
+        return result
+
+    @staticmethod
+    def _paste_from_clipboard() -> None:
         user32 = ctypes.windll.user32
         user32.keybd_event(0x11, 0, 0, 0)
         user32.keybd_event(0x56, 0, 0, 0)
         user32.keybd_event(0x56, 0, 0x0002, 0)
         user32.keybd_event(0x11, 0, 0x0002, 0)
-        return {"target": target, "typed_characters": len(text), "value_recorded": False}
 
     def _start(
         self,
@@ -562,6 +671,14 @@ def computer_tools(storage: Storage, settings: Settings | None = None) -> list[T
                 "固定コマンドを実行",
                 CommandArgs.model_validate(a).model_dump(),
             ),
+        ),
+        ToolDefinition(
+            "computer.clipboard.metadata",
+            "Read clipboard availability and secret classification without returning content.",
+            EmptyArgs,
+            lambda _a, _c: ToolResult(status="ok", evidence=service.clipboard_metadata()),
+            RiskLevel.R0,
+            required_permissions=("computer.clipboard.read",),
         ),
         ToolDefinition(
             "computer.clipboard.read",

@@ -39,6 +39,10 @@ jobs:
         run: ruff check .
       - name: Unit tests
         run: pytest
+      - name: Install matching Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Browser integration tests
+        run: pytest -m "integration and browser"
       - name: Local E2E profile
         run: pytest -m e2e
       - name: Compile package

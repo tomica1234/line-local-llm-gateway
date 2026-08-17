@@ -296,6 +296,33 @@ class PlaywrightController:
                 BrowserAction.WAIT,
             }:
                 raise HumanTakeoverActive("Browser profile is paused after takeover timeout")
+            pre_signals = await self._signals(self._page(session))
+            preexisting_human_signal = next(
+                (item for item in pre_signals if item["type"] == "human_required"), None
+            )
+            if (
+                preexisting_human_signal
+                and action
+                not in {
+                    BrowserAction.SNAPSHOT,
+                    BrowserAction.TABS,
+                    BrowserAction.SCREENSHOT,
+                    BrowserAction.GET_URL,
+                    BrowserAction.GET_DOWNLOADS,
+                    BrowserAction.WAIT,
+                }
+                and context is not None
+            ):
+                self._set_takeover(
+                    profile,
+                    session,
+                    reason=preexisting_human_signal["reason"],
+                    task_id=context.task_id,
+                    timeout_seconds=self.settings.takeover_timeout_seconds,
+                )
+                raise HumanTakeoverActive(
+                    f"Human verification is required: {preexisting_human_signal['reason']}"
+                )
             result = await self._dispatch(profile, session, action, params, context)
             page = self._page(session)
             signals = await self._signals(page)
@@ -896,12 +923,14 @@ class PlaywrightController:
             result = {"receipt_url": None, "adapter_id": None}
         patterns = {
             "confirmation_number": (
-                r"(?i)(?:confirmation|確認)(?:\s*(?:number|番号|no\.?))?"
-                r"\s*[:#：]?\s*([A-Z0-9-]{5,40})"
+                r"(?i)(?:confirmation|確認)\s*"
+                r"(?:(?:number|番号|no\.?)\s*[:#：]?|[:#：])\s*"
+                r"([A-Z0-9][A-Z0-9-]{4,39})"
             ),
             "booking_id": (
-                r"(?i)(?:booking|reservation|予約)(?:\s*(?:id|番号|no\.?))?"
-                r"\s*[:#：]?\s*([A-Z0-9-]{5,40})"
+                r"(?i)(?:booking|reservation|予約)\s*"
+                r"(?:(?:id|number|番号|no\.?)\s*[:#：]?|[:#：])\s*"
+                r"([A-Z0-9][A-Z0-9-]{4,39})"
             ),
         }
         for key, pattern in patterns.items():

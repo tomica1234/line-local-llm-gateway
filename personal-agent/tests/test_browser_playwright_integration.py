@@ -21,9 +21,9 @@ from personal_agent.browser_worker.models import (
 )
 from personal_agent.browser_worker.store import BrowserWorkerStore
 
-pytest.importorskip("playwright.async_api")
 
-
+@pytest.mark.integration
+@pytest.mark.browser
 @pytest.mark.asyncio
 async def test_real_playwright_snapshot_type_secret_guard_and_masked_screenshot(
     tmp_path: Path,

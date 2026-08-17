@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+import json
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from personal_agent.audit import AuditLogger
 from personal_agent.core.capabilities import build_capability_plan
-from personal_agent.personal_data.models import DiaryCreate, PersonalTodoCreate, TodoStatus
+from personal_agent.personal_data.models import (
+    DiaryCreate,
+    PersonalTodoCreate,
+    PersonalTodoUpdate,
+    TodoRecurrence,
+    TodoRecurrenceFrequency,
+    TodoStatus,
+)
 from personal_agent.personal_data.store import PersonalDataStore, business_date
 from personal_agent.personal_data.tools import personal_data_tools
 from personal_agent.policy.engine import PolicyEngine
@@ -85,6 +93,96 @@ def test_personal_todo_and_diary_use_separate_structured_tables(tmp_path) -> Non
     assert exported["diary_entries"][0]["diary_id"] == entry.diary_id
     deleted = portability.delete("personal", confirmation="DELETE:personal")
     assert deleted["deleted"] == {"personal_todos": 1, "diary_entries": 1}
+
+
+def test_todo_recurrence_can_be_removed_and_replaced_without_orphan_jobs(tmp_path) -> None:
+    storage = Storage(tmp_path / "todo-recurrence.sqlite3")
+    storage.initialize()
+    store = PersonalDataStore(storage, user_id="primary", timezone="Asia/Tokyo")
+    store.initialize()
+    reminder = datetime.now(UTC) + timedelta(hours=2)
+
+    daily = store.create_todo(
+        PersonalTodoCreate(
+            type="must",
+            title="Daily without reminder",
+            recurrence=TodoRecurrence(frequency=TodoRecurrenceFrequency.DAILY),
+        )
+    )
+    daily = store.update_todo(daily.todo_id, PersonalTodoUpdate(recurrence=None))
+    with storage.read_connection() as connection:
+        daily_json = connection.execute(
+            "SELECT recurrence_json FROM personal_todos WHERE todo_id=?", (daily.todo_id,)
+        ).fetchone()["recurrence_json"]
+    assert daily.recurrence is None
+    assert daily_json is None
+
+    weekly = store.create_todo(
+        PersonalTodoCreate(
+            type="must",
+            title="Weekly reminder",
+            remind_at=reminder,
+            recurrence=TodoRecurrence(frequency=TodoRecurrenceFrequency.WEEKLY),
+        )
+    )
+    old_weekly_job = weekly.reminder_job_id
+    nonrecurring = store.update_todo(weekly.todo_id, PersonalTodoUpdate(recurrence=None))
+    with storage.read_connection() as connection:
+        weekly_jobs = connection.execute(
+            "SELECT job_id, status, payload_json FROM scheduled_jobs "
+            "WHERE resource_type='personal_todo' AND resource_id=? ORDER BY created_at, rowid",
+            (weekly.todo_id,),
+        ).fetchall()
+    assert nonrecurring.recurrence is None
+    assert len(weekly_jobs) == 2
+    assert weekly_jobs[0]["job_id"] == old_weekly_job
+    assert weekly_jobs[0]["status"] == "cancelled"
+    assert weekly_jobs[1]["status"] == "scheduled"
+    assert "recurrence" not in json.loads(weekly_jobs[1]["payload_json"])
+
+    changing = store.create_todo(
+        PersonalTodoCreate(
+            type="want",
+            title="Change recurrence",
+            remind_at=reminder,
+            recurrence=TodoRecurrence(frequency=TodoRecurrenceFrequency.WEEKLY),
+        )
+    )
+    old_changing_job = changing.reminder_job_id
+    monthly = store.update_todo(
+        changing.todo_id,
+        PersonalTodoUpdate(recurrence=TodoRecurrence(frequency=TodoRecurrenceFrequency.MONTHLY)),
+    )
+    with storage.read_connection() as connection:
+        changing_jobs = connection.execute(
+            "SELECT job_id, status, payload_json FROM scheduled_jobs "
+            "WHERE resource_type='personal_todo' AND resource_id=? ORDER BY created_at, rowid",
+            (changing.todo_id,),
+        ).fetchall()
+    assert monthly.recurrence is not None
+    assert monthly.recurrence.frequency is TodoRecurrenceFrequency.MONTHLY
+    assert changing_jobs[0]["job_id"] == old_changing_job
+    assert changing_jobs[0]["status"] == "cancelled"
+    assert changing_jobs[1]["status"] == "scheduled"
+    assert json.loads(changing_jobs[1]["payload_json"])["recurrence"]["frequency"] == "monthly"
+
+    store.complete_todo(weekly.todo_id)
+    deleted = store.create_todo(
+        PersonalTodoCreate(
+            type="must",
+            title="Delete recurring reminder",
+            remind_at=reminder,
+            recurrence=TodoRecurrence(frequency=TodoRecurrenceFrequency.DAILY),
+        )
+    )
+    store.delete_todo(deleted.todo_id)
+    with storage.read_connection() as connection:
+        remaining = connection.execute(
+            "SELECT COUNT(*) AS count FROM scheduled_jobs WHERE status='scheduled' "
+            "AND resource_type='personal_todo' AND resource_id IN (?, ?)",
+            (weekly.todo_id, deleted.todo_id),
+        ).fetchone()["count"]
+    assert remaining == 0
 
 
 @pytest.mark.asyncio

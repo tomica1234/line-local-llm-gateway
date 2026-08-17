@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from enum import StrEnum
 from typing import Any
@@ -16,6 +17,16 @@ class ModelTier(StrEnum):
     VISION = "vision"
 
 
+class ModelRequestPurpose(StrEnum):
+    FAST_TEXT = "fast_text"
+    GENERAL = "general"
+    PLANNING = "planning"
+    TOOL_REASONING = "tool_reasoning"
+    CODING = "coding"
+    VISION = "vision"
+    EXTRACTION = "extraction"
+
+
 class ModelSpec(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -30,6 +41,43 @@ class ModelSpec(BaseModel):
     supports_tools: bool
     supports_vision: bool
     supports_json: bool
+
+
+class ModelSelection(BaseModel):
+    """A routing decision only; it deliberately contains no permission grant."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    purpose: ModelRequestPurpose
+    tier: ModelTier
+    model_id: str
+    fallback: bool = False
+    reason_code: str
+
+
+def classify_request_purpose(text: str, *, has_tools: bool = False) -> ModelRequestPurpose:
+    """Classify trusted user text only; this selects a model and never grants capability."""
+
+    normalized = text.casefold()
+    if has_tools:
+        return ModelRequestPurpose.TOOL_REASONING
+    if re.search(r"repo|repository|コード|実装|修正|テスト|ci|coding|codex", normalized):
+        return ModelRequestPurpose.CODING
+    if re.search(r"計画|plan|capability|手順|複数段階|比較して.*決め", normalized):
+        return ModelRequestPurpose.PLANNING
+    if re.search(
+        r"送って|送信|返信|購入|予約|支払|振り込|削除|変更して|実行して|"
+        r"ログイン|アップロード|ダウンロード|クリック|入力して",
+        normalized,
+    ):
+        return ModelRequestPurpose.TOOL_REASONING
+    if re.search(r"json", normalized) and re.search(
+        r"抽出|extract|変換|convert|構造化", normalized
+    ):
+        return ModelRequestPurpose.EXTRACTION
+    if re.search(r"要約|短く|3語|三語|翻訳|言い換え|整形|summari[sz]e|translate", normalized):
+        return ModelRequestPurpose.FAST_TEXT
+    return ModelRequestPurpose.GENERAL
 
 
 class ModelRegistry:
@@ -133,10 +181,56 @@ class LocalModelRouter:
             clients={ModelTier.FAST: fast, ModelTier.STRONG: strong, ModelTier.VISION: vision},
         )
 
-    async def complete(self, messages: Sequence[dict[str, object]]) -> str:
-        characters = sum(len(str(message.get("content", ""))) for message in messages)
-        tier = ModelTier.FAST if characters <= 2_000 else ModelTier.STRONG
-        return await self.clients[tier].complete(messages)
+    def select(self, purpose: ModelRequestPurpose) -> ModelSelection:
+        if purpose is ModelRequestPurpose.VISION:
+            specification = self.registry.get(ModelTier.VISION)
+            if not specification.supports_vision:
+                raise RuntimeError("Vision model is not configured")
+            return ModelSelection(
+                purpose=purpose,
+                tier=ModelTier.VISION,
+                model_id=specification.model_id,
+                reason_code="EXPLICIT_VISION_PURPOSE",
+            )
+        if purpose in {ModelRequestPurpose.FAST_TEXT, ModelRequestPurpose.EXTRACTION}:
+            fallback = self.clients[ModelTier.FAST] is self.clients[ModelTier.STRONG]
+            tier = ModelTier.STRONG if fallback else ModelTier.FAST
+            return ModelSelection(
+                purpose=purpose,
+                tier=tier,
+                model_id=self.registry.get(tier).model_id,
+                fallback=fallback,
+                reason_code=("FAST_UNCONFIGURED_STRONG_FALLBACK" if fallback else "FAST_PURPOSE"),
+            )
+        specification = self.registry.get(ModelTier.STRONG)
+        return ModelSelection(
+            purpose=purpose,
+            tier=ModelTier.STRONG,
+            model_id=specification.model_id,
+            reason_code="STRONG_PURPOSE",
+        )
+
+    def select_for_text(self, text: str, *, has_tools: bool = False) -> ModelSelection:
+        return self.select(classify_request_purpose(text, has_tools=has_tools))
+
+    async def complete(
+        self,
+        messages: Sequence[dict[str, object]],
+        *,
+        purpose: ModelRequestPurpose = ModelRequestPurpose.GENERAL,
+    ) -> str:
+        return await self.complete_for(messages, purpose=purpose)
+
+    async def complete_for(
+        self,
+        messages: Sequence[dict[str, object]],
+        *,
+        purpose: ModelRequestPurpose,
+    ) -> str:
+        selection = self.select(purpose)
+        if selection.tier is ModelTier.VISION:
+            raise RuntimeError("Vision requests require complete_vision with image bytes")
+        return await self.clients[selection.tier].complete(messages)
 
     async def complete_with_tools(
         self,
@@ -148,9 +242,7 @@ class LocalModelRouter:
     async def complete_vision(
         self, *, image_bytes: bytes, media_type: str, prompt: str
     ) -> ModelTurn:
-        specification = self.registry.get(ModelTier.VISION)
-        if not specification.supports_vision:
-            raise RuntimeError("Vision model is not configured")
+        self.select(ModelRequestPurpose.VISION)
         client = self.clients[ModelTier.VISION]
         complete_vision = getattr(client, "complete_vision", None)
         if complete_vision is None:

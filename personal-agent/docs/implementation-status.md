@@ -14,6 +14,7 @@ Alexaと実銀行送金は今回のscope外です。
 - Plan/Stepのstatus、入出力、evidence、attempt、model、prompt versionのSQLite永続化
 - 完了step skip、read step resume、in-flight mutationの`SUBMITTED_UNKNOWN`停止
 - Todo reminderのScheduler連携、update時差替え、complete/delete時cancel、snooze、recurrence
+- recurrence解除時のDB NULL化、weekly→monthly差替え、旧job cancelと非recurring job再作成
 - component別schema migration framework
 - LLM Capability Proposalと、ユーザー原文/allowlist/riskに基づく決定論的validator
 
@@ -30,10 +31,13 @@ Alexaと実銀行送金は今回のscope外です。
 
 ### Model / agent capability
 
-- Tier 0 deterministic、設定可能なfast、strong Qwen、optional local VisionのModel Registry/Router
+- Tier 0 deterministicと、文字数ではなくtyped purposeでfast/strong/visionを選ぶModel Registry/Router
+- Capability planning/tool reasoning/coding/generalはstrong。低risk text/extractionだけfast
 - 補助modelを含むlocal endpoint強制。remote許可はoperator設定だけ
 - DOM/native extraction後だけのVision。Vision結果からpermission追加不可
 - process/app/job/clipboard/desktop/fixed-commandの型付きComputer tool
+- Clipboard metadata、JWT/Bearer/token/private-key/high-entropy検出とsecret-like raw返却禁止
+- desktop.typeの一時clipboard利用とsuccess/exception時restore、restore失敗の値なしwarning
 - cwd/app/command/env allowlist、timeout、output上限、child cleanup、no shell/no sudo/no secret env
 - allowlisted repo内のCodex job start/send/status/cancel/test、永続job、完了通知
 - Codexはworkspace/read-only sandbox、network off、commit/pushなしを既定にする
@@ -66,7 +70,10 @@ Alexaと実銀行送金は今回のscope外です。
 - Todo scheduler/recurrence、Calendar conflict、Gmail OAuth/refresh/attachment quarantine
 - Contacts ambiguity、各file parser、Vision順序、Computer/Coding allowlist
 - Commerce quote/reconciliation/no-resend、Hybrid Memory/supersedes、Proactive event rule
-- Browser SSRF、private subresource、finance allowlist、secret field、takeover、real Chromium DOM操作
+- Browser SSRF、private subresource、finance allowlist、secret field、takeover
+- external webpage/email/file/visionからのcapability昇格拒否
+- 用途別Model routing、Vision未設定fail-closed、Plannerの明示的strong purpose
+- Clipboard通常文/token/JWT/private key/high-entropy/OTP context、desktop restore/secret target拒否
 - LINE署名/primary user、Tailscale header spoofing、WebAuthn binding、secret redaction
 - backup round-trip/verify/prune、doctor DB check、observability
 
@@ -76,8 +83,16 @@ Alexaと実銀行送金は今回のscope外です。
 - Diary create/search、Memory create/search、local Calendar create/list
 - Browser Worker APIのauth/idempotency、Privileged Gmail/Slack/Google refresh mock
 - Playwright Chromiumのsnapshot/type/secret guard/submit verification/masked screenshot
-- local browser fixtureにform/login/popup/download/upload/confirmation/CAPTCHA/prompt-injection case
+- local HTTP fixtureを実Chromium Controllerで操作するform/type/submit/postcondition test
+- password direct type拒否、popup/tab、隔離download+SHA-256、allowlisted uploadとroot外拒否
+- confirmation/booking ID抽出、DOM stale ref拒否、CAPTCHA検出後のHuman Takeoverと再submit停止
+- fixtureのprompt injection文字列を実browserで取得。permission/tool exposure不変は上記Unitで検証
 - Core restart相当のExecutionStore再生成とmutation不明状態復旧
+
+## GitHub Actions確認
+
+- この仕上げ修正はpush前。Python 3.11/3.12/securityの結果はpush後に確認し、green確認前は
+  「GitHub Actions確認済み」と扱わない
 
 ## 実機検証済み
 
@@ -113,7 +128,8 @@ Alexaと実銀行送金は今回のscope外です。
 ## 実運用前の必須確認
 
 1. `personal-agent doctor`で設定済みcomponentがすべて`OK`になること。
-2. `ruff check .`、`pytest`、`pytest -m e2e`、`python -m compileall -q src`を再実行すること。
+2. `ruff check .`、`pytest`、`pytest -m "integration and browser"`、`pytest -m e2e`、
+   `python -m compileall -q src`を再実行すること。
 3. Tailscale Grant/ACLを本人identityとPersonal Agent portだけに絞ること。
 4. iPhone以外のbackup passkeyを登録すること。
 5. Windows BitLocker/Device Encryption、Worker profile/Secret DB ACL、backup restore手順を確認すること。

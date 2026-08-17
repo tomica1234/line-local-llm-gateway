@@ -68,12 +68,14 @@ personal-agent-line-desktop = "personal_agent.line_desktop_bridge.main:run"
 packages = ["src/personal_agent"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q -m 'not integration and not e2e and not real_device and not real_credential'"
 testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 markers = [
   "e2e: local end-to-end profile without real credentials or devices",
+  "integration: crosses a real subsystem boundary and may require local runtime assets",
+  "browser: launches a real Playwright Chromium browser",
   "real_device: requires a Windows/iPhone device and is excluded from CI",
   "real_credential: requires operator-owned provider credentials and is excluded from CI",
 ]

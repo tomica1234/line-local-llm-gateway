@@ -436,6 +436,14 @@ def create_browser_worker_app(
                 warnings=[str(exc), "FRESH_SNAPSHOT_REQUIRED"],
                 result={"executed": False, "verified": False},
             )
+        except PermissionError as exc:
+            response = BrowserResult(
+                status="denied",
+                profile=profile,
+                action=action.value,
+                warnings=[str(exc)],
+                result={"executed": False, "verified": False},
+            )
         except BrowserUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except Exception as exc:

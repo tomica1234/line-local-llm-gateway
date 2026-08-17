@@ -67,7 +67,8 @@ class ExampleReservationAdapter:
     def extract_confirmation(self, page: AdapterPage) -> dict[str, Any]:
         number = re.search(
             r"(?i)(?:confirmation|booking|reservation|確認|予約)"
-            r"(?:\s*(?:number|id|番号|no\.?))?\s*[:#：]?\s*([A-Z0-9-]{5,40})",
+            r"\s*(?:(?:number|id|番号|no\.?)\s*[:#：]?|[:#：])\s*"
+            r"([A-Z0-9][A-Z0-9-]{4,39})",
             page.text,
         )
         total = re.search(

@@ -47,10 +47,12 @@ Phase別の対応範囲は [docs/implementation-status.md](docs/implementation-s
 - Slack/Gmail tokenをCoreやLLMへ渡さないPrivileged Connector Worker
 - ローカルCalendarの検索・空き時間・作成・更新・取消と永続Scheduler
 - Agent実行Taskとは別tableのPersonalTodoと構造化Diary、Asia/Tokyoの深夜business date
+- Todo recurrenceの解除・変更時に旧jobをcancelし、必要な新jobだけを作るScheduler差替え
 - Economic Action、確定見積、Budget、Payee、Sandbox送金、照合、`SUBMITTED_UNKNOWN`
 - allowlist root内だけのFile検索・読取・コピー・移動・改名・回収可能な削除
 - PDF/DOCX/XLSX/PPTX/HTML/Image/ZIPの非実行解析、PDF table、Vision fallback
 - allowlistされたProcess/App/Job/Clipboard/Desktop/固定CommandだけのComputer Automation
+- Clipboard metadata、JWT/Bearer/API token/high-entropy検出、secret redaction、desktop入力後の復元
 - allowlist repository内での永続Codex job、test実行、cancel、完了通知
 - Home Assistantの状態取得・照明・温度・Scene（lock/alarmはfail-closed）
 - 既定OFFのProactive検出、quiet hours、通知頻度、根拠付き継続follow-up
@@ -81,8 +83,8 @@ Voice text / LINE webhook / Web PWA
         ┌─────────┴─────────┐
         ▼                   ▼
   Tier 0 Router       Local Model Router
-                       ├─ fast
-                       ├─ strong Qwen
+                       ├─ fast（明示的な低risk text/extraction）
+                       ├─ strong Qwen（planning/tool/coding/general）
                        └─ vision
         │                   │
         └─────────┬─────────┘
@@ -621,10 +623,15 @@ R4/R5のAction承認にはsessionだけでなく、そのActionへbindingされ�
 
 ## テスト
 
+既定の`pytest`はUnitだけを実行します。実Chromiumを使うBrowser integrationとLocal E2Eは、
+Playwright packageと同じversionのbrowser binaryを導入して明示的に実行します。
+
 ```bash
 .venv/bin/ruff check .
-.venv/bin/pytest -q
-.venv/bin/pytest -q -m e2e
+.venv/bin/pytest
+.venv/bin/python -m playwright install chromium
+.venv/bin/pytest -m "integration and browser"
+.venv/bin/pytest -m e2e
 .venv/bin/python -m compileall -q src
 ```
 
@@ -675,7 +682,9 @@ Benchmark、WebAuthn challenge binding・有効期限・single-use・passkey ses
 
 ## CIとローカル検証
 
-GitHub Actionsはlocked dependencyでPython 3.11/3.12のRuff/pytest/compileall/Local E2Eを実行し、
+GitHub Actionsはlocked dependencyでPython 3.11/3.12のRuff/Unit/Browser integration/Local E2E/
+compileallを実行します。Playwright Chromiumはlock済みPython packageのinstall後に同じ環境の
+`python -m playwright install --with-deps chromium`で導入し、version不整合を避けます。
 別jobでpip-audit、Bandit、detect-secretsを実行します。Dependabotはpip/Actionsを週次確認します。
 Windows/DPAPI/Windows Hello/実providerはLinux CIで
 実機E2Eせず、unit testではfakeまたはmockを使います。ローカル仮想環境`.venv/`、`.env`、SQLite DB、

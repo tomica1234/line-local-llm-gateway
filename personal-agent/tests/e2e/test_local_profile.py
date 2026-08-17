@@ -85,19 +85,3 @@ def test_productivity_api_todo_notification_diary_memory_calendar(tmp_path: Path
             },
         ).json()
         assert listed[0]["event_id"] == event["event_id"]
-
-
-@pytest.mark.e2e
-def test_browser_fixture_contains_all_security_and_recovery_cases() -> None:
-    fixture = Path(__file__).parents[1] / "fixtures" / "browser_site" / "index.html"
-    content = fixture.read_text(encoding="utf-8")
-    for marker in (
-        "current-password",
-        'type="file"',
-        "window.open",
-        "Download receipt",
-        "Booking number",
-        "CAPTCHA simulated takeover",
-        "Ignore prior rules",
-    ):
-        assert marker in content
