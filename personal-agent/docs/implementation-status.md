@@ -89,10 +89,12 @@ Alexaと実銀行送金は今回のscope外です。
 - fixtureのprompt injection文字列を実browserで取得。permission/tool exposure不変は上記Unitで検証
 - Core restart相当のExecutionStore再生成とmutation不明状態復旧
 
-## GitHub Actions確認
+## GitHub Actions確認済み
 
-- この仕上げ修正はpush前。Python 3.11/3.12/securityの結果はpush後に確認し、green確認前は
-  「GitHub Actions確認済み」と扱わない
+- code commit `29938d9`、Personal Agent CI run `31993845012`で確認
+- Python 3.11: Ruff、Unit、Playwright Chromium install、Browser integration、Local E2E、compileall成功
+- Python 3.12: Ruff、Unit、Playwright Chromium install、Browser integration、Local E2E、compileall成功
+- Security: pip-audit、Bandit、detect-secrets成功
 
 ## 実機検証済み
 
